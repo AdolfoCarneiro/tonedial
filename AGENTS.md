@@ -47,7 +47,7 @@ Notebook com Fedora KDE e uma **RTX 2050 (4 GB de VRAM)**, com CUDA.
 
 ## Estado
 
-Repo criado em 2026-10-28, ainda sem código. Próximo passo: o brainstorming do design e a spec em `docs/superpowers/specs/`.
+v1 implementada na branch `feat/v1` (2026-10-28): janela, gravação, transcrição e separação de falantes. Modelos conforme `docs/superpowers/specs/2026-10-28-comparacao-modelos.md`. Instalação e uso no `README.md`.
 
 ## Convenções
 

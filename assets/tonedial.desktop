@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Tone Dial
+Comment=Grava ou abre um áudio, transcreve e separa quem falou (local)
+Exec=tonedial
+Icon=audio-input-microphone
+Categories=AudioVideo;Audio;
+Terminal=false
