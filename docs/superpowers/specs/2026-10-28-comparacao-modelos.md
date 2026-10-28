@@ -56,3 +56,31 @@ Diarização no real5: speakrs deu 3 falantes, com turnos estáveis e curtos (12
 ## Decisão
 
 **`ggml-large-v3-q8_0.bin` + speakrs.** É o padrão previsto, e nenhum candidato foi melhor: o q5_0 piorou o WER e a pontuação (não é indistinguível), o turbo perdeu pontuação e repetiu, e o sherpa fragmentou os falantes. Como o repositório `ggerganov/whisper.cpp` não publica o large-v3 q8_0 (só o f16 e o q5_0), a Task 7 já baixa o f16 e quantiza localmente (port em Rust, saída byte-idêntica à do `whisper-quantize`).
+
+## DTW (timestamps por token)
+
+Data: 2026-10-28. Pergunta: o DTW do whisper.cpp (alignment heads, `t_dtw`) melhora a atribuição de falante nas trocas de turno, em relação aos tempos legados `t0/t1` de `set_token_timestamps(true)`?
+
+**Como foi testado.** Protótipo em `asr.rs` (não mantido): `WhisperContextParameters::dtw_parameters` com `DtwMode::ModelPreset { LargeV3 }` (preset escolhido pelo nome do arquivo do modelo; desconhecido → sem DTW), início da palavra = `t_dtw` do primeiro token (fallback para `t0` quando `-1`), fim = `t1` (ou início da palavra seguinte quando o DTW passa do `t1`), tudo passando por `map_to_original` (VAD). Chave `TONEDIAL_DTW=0|1`. Testes unitários do preset e do fallback passaram, assim como `cargo test` inteiro e o teste ignorado `vad_timestamps_stay_on_original_timeline` (tiny, com DTW ligado). Execuções com large-v3 q8_0 + speakrs, **GPU (Vulkan, RTX 2050 livre)**, mesmo binário, só a variável mudando.
+
+Métricas extras (além do `eval.py`): alinhamento palavra a palavra hipótese × referência (Levenshtein); cada palavra de referência casada herda o falante do turno da saída; acerto com o melhor mapeamento. "Bordas" = até 3 palavras de cada lado de uma troca de falante na referência.
+
+| Áudio | DTW | WER | Acerto aprox. (ponto médio) | Acerto por palavra | Acerto nas bordas | Turnos | Turnos ≤2 palavras | Tempo | Pico VRAM |
+|---|---|---|---|---|---|---|---|---|---|
+| NURC 5 min | não | 69,5% | 53,3% | 57,2% | 48,1% (52 pal.) | 6 | 0 | 179 s | 3047 MiB |
+| NURC 5 min | sim | 69,5% | 53,1% | 57,7% | 48,1% (52 pal.) | 6 | 1 | 181 s | 3588 MiB |
+| real5 | não | n/a | n/a | n/a | n/a | 12 | 0 | 163 s | 3111 MiB |
+| real5 | sim | n/a | n/a | n/a | n/a | 14 | 2 | 163 s | 3588 MiB |
+
+(O texto é idêntico com e sem DTW: o DTW só muda os tempos. Na GPU o large-v3 q8_0 produziu 431 palavras no NURC contra 636 na CPU da rodada anterior, por isso o WER difere da tabela acima.)
+
+**Bordas, olhando turno a turno.**
+
+- NURC: as 3 trocas que mudaram foram para o lado certo (ex.: "Bom, colega" passou inteiro para o turno de quem fala, em vez de "Bom," ficar no fim do turno anterior).
+- real5 (11 trocas comparáveis): 2 melhoraram (fim de frase voltou para o falante certo), 5 ficaram iguais e 4 pioraram: um nome próprio separado da sua frase, uma resposta curta jogada para o turno anterior, "pro | lado B" e "com o | Hermes?" partidos em lugar pior, e uma troca virou três fragmentos de 1 palavra (2 turnos de ≤2 palavras novos).
+
+**Custo.** Tempo igual. VRAM: +540 MiB de pico (3,05 → 3,59 GiB de 4 GiB), por causa dos QKs de cross-attention guardados para o DTW. Além disso o DTW do whisper.cpp é marcado como experimental e usa `WHISPER_ASSERT` (aborta o processo) em vários pontos.
+
+**Decisão: fica sem DTW.** Nas métricas de falante o ganho é ruído (+0,5 ponto por palavra, −0,2 no ponto médio, bordas iguais), na reunião real as bordas ficaram mistas, com mais fragmentos, e o custo de VRAM é alto numa placa de 4 GB. O código do DTW foi removido; os tempos continuam vindo de `t0/t1`. Se for revisitar, o problema de borda parece estar mais na diarização (segmentos que cortam no meio da frase) do que nos tempos das palavras.
+
+Observação lateral: mesmo sem DTW, o pico de VRAM (≈3,0–3,1 GiB) passa do que o preflight reserva (modelo 1,66 GB + 1 GiB ≈ 2,7 GB); a folga `GPU_MARGIN_BYTES` talvez precise de uns 0,5 GiB a mais.
