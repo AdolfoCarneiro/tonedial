@@ -39,6 +39,11 @@ fn pick_device(cands: &[(Option<String>, String)], name: &str, default_id: Optio
     cands.iter().position(by_name)
 }
 
+/// Esta entrada é o microfone padrão? Sem id do padrão, nenhuma é.
+fn is_default_entry<T: PartialEq>(id: Option<T>, default_id: Option<T>) -> bool {
+    default_id.is_some() && id == default_id
+}
+
 /// Padrão primeiro, depois os demais na ordem original; sem duplicatas e sem `null`.
 fn order_devices(all: Vec<String>, default: Option<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -76,7 +81,7 @@ pub fn list_input_devices() -> Vec<String> {
         }
         // O nome da descrição do padrão ("Default Audio Device") não está na lista;
         // por isso o padrão é identificado pelo id e listado com o nome da sua entrada.
-        if default_name.is_none() && id == default_id {
+        if default_name.is_none() && is_default_entry(id.as_ref(), default_id.as_ref()) {
             default_name = Some(name.clone());
         }
         all.push(name);
@@ -168,9 +173,54 @@ impl WavSink {
     }
 }
 
-/// `<output_dir>/.tonedial-gravando-<AAAAMMDD-HHMMSS>.wav`
-pub fn temp_wav_path(output_dir: &Path, at: NaiveDateTime) -> PathBuf {
-    output_dir.join(format!(".tonedial-gravando-{}.wav", at.format("%Y%m%d-%H%M%S")))
+const WAV_PREFIX: &str = "gravacao-";
+const WAV_TIME_FORMAT: &str = "%Y%m%d-%H%M%S";
+
+/// Onde o WAV fica enquanto grava e até virar .ogg: `~/.local/share/tonedial/gravacoes`.
+/// Fora da pasta de saída, para não sumir com ela nem ser sincronizado pela metade.
+pub fn recordings_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tonedial")
+        .join("gravacoes")
+}
+
+/// `<dir>/gravacao-<AAAAMMDD-HHMMSS>.wav`
+pub fn temp_wav_path(dir: &Path, at: NaiveDateTime) -> PathBuf {
+    dir.join(format!("{WAV_PREFIX}{}.wav", at.format(WAV_TIME_FORMAT)))
+}
+
+/// WAVs de gravações que não chegaram a virar .ogg (app fechado, falha...), mais antigos primeiro.
+pub fn pending_recordings(dir: &Path) -> Vec<(PathBuf, NaiveDateTime)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<(PathBuf, NaiveDateTime)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            let ts = name.strip_prefix(WAV_PREFIX)?.strip_suffix(".wav")?;
+            let at = NaiveDateTime::parse_from_str(ts, WAV_TIME_FORMAT).ok()?;
+            Some((p, at))
+        })
+        .collect();
+    out.sort_by_key(|(_, at)| *at);
+    out
+}
+
+/// Duração pelo cabeçalho do WAV (atualizado a cada ~1 s durante a gravação).
+pub fn wav_duration_ms(path: &Path) -> Option<u64> {
+    let r = hound::WavReader::open(path).ok()?;
+    let rate = u64::from(r.spec().sample_rate);
+    (rate > 0).then(|| u64::from(r.duration()) * 1000 / rate)
+}
+
+/// Apaga `path` se `r` for erro (o WAV vazio de uma gravação que nem começou).
+fn remove_on_err<T>(r: anyhow::Result<T>, path: &Path) -> anyhow::Result<T> {
+    if r.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    r
 }
 
 /// Stream aberto. `cpal::Stream` não é `Send`: fica na thread da UI.
@@ -293,6 +343,25 @@ impl Monitor {
     }
 }
 
+/// Por que a gravação parou sozinha.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Failure {
+    /// O microfone sumiu ou o stream deu erro.
+    Mic(String),
+    /// Não deu para escrever o WAV (disco cheio etc.).
+    Disk(String),
+}
+
+impl Failure {
+    /// Aviso mostrado enquanto processa o que foi gravado.
+    pub fn note(&self) -> &'static str {
+        match self {
+            Failure::Mic(_) => "O microfone desconectou; processando o que foi gravado",
+            Failure::Disk(_) => "Erro ao gravar no disco; processando o que foi gravado",
+        }
+    }
+}
+
 enum Msg {
     Data(Vec<f32>),
     Stop,
@@ -301,7 +370,7 @@ enum Msg {
 fn writer_loop(
     rx: Receiver<Msg>,
     mut sink: WavSink,
-    failure: Arc<Mutex<Option<String>>>,
+    failure: Arc<Mutex<Option<Failure>>>,
 ) -> anyhow::Result<()> {
     let mut broken = false;
     while let Ok(Msg::Data(chunk)) = rx.recv() {
@@ -310,7 +379,7 @@ fn writer_loop(
         }
         if let Err(e) = sink.push(&chunk) {
             // disco cheio etc.: guarda o motivo e mantém o que já foi escrito
-            *lock(&failure) = Some(format!("erro ao gravar o arquivo: {e}"));
+            *lock(&failure) = Some(Failure::Disk(format!("erro ao gravar o arquivo: {e}")));
             broken = true;
         }
     }
@@ -322,16 +391,22 @@ pub struct Recorder {
     pub wav_path: PathBuf,
     pub started_at: NaiveDateTime,
     started: Instant,
-    failure: Arc<Mutex<Option<String>>>,
+    failure: Arc<Mutex<Option<Failure>>>,
     tx: Sender<Msg>,
     writer: Option<JoinHandle<anyhow::Result<()>>>,
     capture: Option<Capture>,
 }
 
 impl Recorder {
+    /// Abre o microfone e começa a gravar em `wav_path`. Se falhar, não deixa o WAV vazio.
     pub fn start(device: &str, wav_path: PathBuf) -> anyhow::Result<Recorder> {
+        let path = wav_path.clone();
+        remove_on_err(Self::start_inner(device, wav_path), &path)
+    }
+
+    fn start_inner(device: &str, wav_path: PathBuf) -> anyhow::Result<Recorder> {
         let levels = Levels::default();
-        let failure: Arc<Mutex<Option<String>>> = Arc::default();
+        let failure: Arc<Mutex<Option<Failure>>> = Arc::default();
         let (tx, rx) = mpsc::channel::<Msg>();
 
         // A taxa nativa só é conhecida ao abrir o dispositivo; o WAV é criado nesse momento.
@@ -354,7 +429,7 @@ impl Recorder {
             move |msg| {
                 let mut f = lock(&fail_cb);
                 if f.is_none() {
-                    *f = Some(msg);
+                    *f = Some(Failure::Mic(msg));
                 }
             },
         )?;
@@ -365,7 +440,7 @@ impl Recorder {
         // primeiro bloco para o cronômetro e o WAV começarem juntos.
         let deadline = Instant::now() + Duration::from_secs(3);
         while !got_data.load(Ordering::Acquire) {
-            if let Some(e) = lock(&failure).clone() {
+            if let Some(Failure::Mic(e) | Failure::Disk(e)) = lock(&failure).clone() {
                 return Err(anyhow!("{e}"));
             }
             if Instant::now() > deadline {
@@ -391,8 +466,8 @@ impl Recorder {
         self.started.elapsed()
     }
 
-    /// Mensagem de erro se o microfone sumiu ou a escrita falhou.
-    pub fn failed(&self) -> Option<String> {
+    /// Motivo, se o microfone sumiu ou a escrita falhou.
+    pub fn failed(&self) -> Option<Failure> {
         lock(&self.failure).clone()
     }
 
@@ -533,16 +608,98 @@ mod tests {
         assert_eq!(buf, vec![0.5, 0.5]);
     }
 
+    fn at(h: u32, m: u32, s: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 28).unwrap().and_hms_opt(h, m, s).unwrap()
+    }
+
     #[test]
     fn temp_wav_path_format() {
-        let at = chrono::NaiveDate::from_ymd_opt(2026, 10, 28)
-            .unwrap()
-            .and_hms_opt(9, 5, 7)
-            .unwrap();
         assert_eq!(
-            temp_wav_path(Path::new("/out"), at),
-            PathBuf::from("/out/.tonedial-gravando-20261028-090507.wav")
+            temp_wav_path(Path::new("/dados/gravacoes"), at(9, 5, 7)),
+            PathBuf::from("/dados/gravacoes/gravacao-20261028-090507.wav")
         );
+    }
+
+    #[test]
+    fn recordings_dir_is_in_data_dir() {
+        let d = recordings_dir();
+        assert!(d.ends_with("tonedial/gravacoes"), "{}", d.display());
+    }
+
+    #[test]
+    fn pending_recordings_finds_leftover_wavs_sorted() {
+        let d = tempfile::tempdir().unwrap();
+        let a = temp_wav_path(d.path(), at(14, 30, 0));
+        let b = temp_wav_path(d.path(), at(9, 5, 7));
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        std::fs::write(d.path().join("outro.wav"), b"x").unwrap();
+        std::fs::write(d.path().join("gravacao-lixo.wav"), b"x").unwrap();
+        std::fs::write(d.path().join("gravacao-20261028-090507.ogg"), b"x").unwrap();
+        assert_eq!(pending_recordings(d.path()), vec![(b, at(9, 5, 7)), (a, at(14, 30, 0))]);
+    }
+
+    #[test]
+    fn pending_recordings_of_missing_dir_is_empty() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(pending_recordings(&d.path().join("nao-existe")).is_empty());
+    }
+
+    #[test]
+    fn wav_duration_reads_header() {
+        let p = tmp("dur");
+        let mut s = WavSink::create(&p, 16_000).unwrap();
+        s.push(&vec![0.0; 24_000]).unwrap();
+        s.finish().unwrap();
+        assert_eq!(wav_duration_ms(&p), Some(1_500));
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(wav_duration_ms(&p), None);
+    }
+
+    #[test]
+    fn failed_start_removes_the_empty_wav() {
+        let p = tmp("start-fail");
+        std::fs::write(&p, b"").unwrap();
+        let r: anyhow::Result<()> = remove_on_err(Err(anyhow!("o microfone não respondeu")), &p);
+        assert!(r.is_err());
+        assert!(!p.exists());
+        let q = tmp("start-ok");
+        std::fs::write(&q, b"").unwrap();
+        assert!(remove_on_err(Ok(()), &q).is_ok());
+        assert!(q.exists());
+        let _ = std::fs::remove_file(&q);
+    }
+
+    #[test]
+    fn disk_error_is_not_reported_as_mic() {
+        // /dev/full aceita abrir, mas toda escrita falha com "sem espaço".
+        let sink = WavSink::create(Path::new("/dev/full"), 1_000).unwrap();
+        let failure: Arc<Mutex<Option<Failure>>> = Arc::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Data(vec![0.1; 10_000])).unwrap();
+        tx.send(Msg::Stop).unwrap();
+        let _ = writer_loop(rx, sink, failure.clone());
+        assert!(matches!(lock(&failure).clone(), Some(Failure::Disk(_))), "{:?}", lock(&failure));
+    }
+
+    #[test]
+    fn failure_messages() {
+        assert_eq!(
+            Failure::Mic("x".into()).note(),
+            "O microfone desconectou; processando o que foi gravado"
+        );
+        assert_eq!(
+            Failure::Disk("x".into()).note(),
+            "Erro ao gravar no disco; processando o que foi gravado"
+        );
+    }
+
+    #[test]
+    fn default_name_needs_a_default_id() {
+        assert!(!is_default_entry::<&str>(None, None));
+        assert!(is_default_entry(Some("a"), Some("a")));
+        assert!(!is_default_entry(Some("a"), Some("b")));
+        assert!(!is_default_entry(Some("a"), None));
     }
 
     #[test]
