@@ -33,6 +33,14 @@ Os modelos são baixados na primeira vez, para `~/.local/share/tonedial/models`.
 
 A configuração fica em `~/.config/tonedial/config.json`.
 
+## Gravações
+
+- Enquanto grava, o áudio fica em `~/.local/share/tonedial/gravacoes/` (fora da pasta de saída, para não ser sincronizado pela metade). Ao processar, vira `<data>.ogg` na pasta de saída e o WAV temporário é apagado.
+- Se algo der errado, a mensagem de erro diz onde o áudio está salvo.
+- Se o app fechar no meio (ou você fechar durante a gravação), a gravação fica guardada. Na próxima abertura aparece "Gravação não processada de ..." com **Processar** e **Descartar**.
+- Enquanto grava, processa ou baixa os modelos, o app impede o notebook de suspender (`systemd-inhibit`).
+- Se não separar os falantes (erro no modelo), o texto sai mesmo assim, todo como Falante 1, com um aviso.
+
 ## Como gravar bem no celular
 
 - Use o gravador padrão do celular, no formato padrão dele (m4a, por exemplo).
