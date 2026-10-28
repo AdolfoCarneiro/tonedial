@@ -45,7 +45,7 @@ fn run(bin: &str, args: &[&std::ffi::OsStr]) -> Result<Output> {
         })
 }
 
-fn check_ffmpeg_at(bin: &str) -> Result<()> {
+pub(crate) fn check_ffmpeg_at(bin: &str) -> Result<()> {
     let out = run(bin, &["-version".as_ref()])?;
     if !out.status.success() {
         bail!(MISSING_FFMPEG);
