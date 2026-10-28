@@ -11,8 +11,15 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use crate::audio::record::{Monitor, Recorder, list_input_devices, temp_wav_path};
+use chrono::NaiveDateTime;
+
+use crate::audio::decode;
+use crate::audio::record::{
+    Failure, Monitor, Recorder, list_input_devices, pending_recordings, recordings_dir,
+    temp_wav_path, wav_duration_ms,
+};
 use crate::config::Config;
+use crate::inhibit::SleepGuard;
 use crate::models::{SetupProgress, ensure_models, missing_models, models_dir};
 use crate::pipeline::{self, Job, Outcome, Progress, Source, Stage};
 
@@ -45,6 +52,14 @@ impl ProcessingState {
             note,
         }
     }
+}
+
+/// Gravação que ficou em `gravacoes/` sem virar transcrição.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub wav: PathBuf,
+    pub started_at: NaiveDateTime,
+    pub duration_ms: Option<u64>,
 }
 
 pub enum Screen {
@@ -88,6 +103,43 @@ pub struct App {
     mic_error: Option<String>,
     setup_rx: Option<Receiver<SetupProgress>>,
     proc_rx: Option<Receiver<Progress>>,
+    recordings_dir: PathBuf,
+    pending: Vec<Pending>,
+    /// WAV pendente esperando confirmação de "Descartar".
+    confirm_discard: Option<PathBuf>,
+    sleep_guard: Option<SleepGuard>,
+}
+
+/// Título da tela de processamento de uma gravação.
+pub fn recording_title(started_at: NaiveDateTime) -> String {
+    format!("Gravação de {}", started_at.format("%H:%M"))
+}
+
+/// "Gravação não processada de 28/10/2026 14:30 (12 min)".
+pub fn pending_label(started_at: NaiveDateTime, duration_ms: Option<u64>) -> String {
+    let base = format!("Gravação não processada de {}", started_at.format("%d/%m/%Y %H:%M"));
+    match duration_ms {
+        Some(ms) => format!("{base} ({})", format_duration_ms(ms)),
+        None => base,
+    }
+}
+
+/// Texto do modal de fechar: gravando ou processando.
+pub fn close_message(recording: bool) -> &'static str {
+    if recording {
+        "Parar a gravação e fechar? O áudio fica salvo e você pode processar depois."
+    } else {
+        "Fechar agora? O processamento será perdido, mas o áudio continua salvo."
+    }
+}
+
+/// Segura a suspensão enquanto grava, processa ou baixa os modelos.
+fn inhibit_wanted(screen: &Screen, setup_running: bool) -> bool {
+    match screen {
+        Screen::Recording(_) | Screen::Processing(_) => true,
+        Screen::Setup(_) => setup_running,
+        Screen::Idle | Screen::Done(_) | Screen::Error(_) => false,
+    }
 }
 
 /// Tempo restante por extrapolação linear; vazio nos primeiros 5% da etapa.
@@ -138,6 +190,62 @@ impl App {
             mic_error: None,
             setup_rx: None,
             proc_rx: None,
+            recordings_dir: recordings_dir(),
+            pending: Vec::new(),
+            confirm_discard: None,
+            sleep_guard: None,
+        }
+    }
+
+    /// Relê `gravacoes/`. Só chamar fora da gravação (o WAV em andamento também apareceria).
+    fn refresh_pending(&mut self) {
+        self.pending = pending_recordings(&self.recordings_dir)
+            .into_iter()
+            .map(|(wav, started_at)| Pending {
+                duration_ms: wav_duration_ms(&wav),
+                wav,
+                started_at,
+            })
+            .collect();
+    }
+
+    /// Botão "Descartar": só pede confirmação.
+    fn request_discard(&mut self, i: usize) {
+        self.confirm_discard = self.pending.get(i).map(|p| p.wav.clone());
+    }
+
+    /// "Descartar" confirmado: apaga o WAV.
+    fn discard_confirmed(&mut self) {
+        let Some(wav) = self.confirm_discard.take() else { return };
+        if let Err(e) = std::fs::remove_file(&wav) {
+            if wav.exists() {
+                self.mic_error = Some(format!("Não consegui apagar {}: {e}", wav.display()));
+            }
+        }
+        self.refresh_pending();
+    }
+
+    /// Botão "Processar" de uma gravação pendente.
+    fn process_pending(&mut self, i: usize) {
+        let Some(p) = self.pending.get(i).cloned() else { return };
+        if self.ensure_output_dir().is_none() {
+            return;
+        }
+        self.monitor = None;
+        self.start_processing(
+            Source::Recording { wav: p.wav, started_at: p.started_at },
+            recording_title(p.started_at),
+            None,
+        );
+    }
+
+    /// Liga/desliga o bloqueio de suspensão conforme a tela.
+    fn sync_sleep_guard(&mut self) {
+        let want = inhibit_wanted(&self.screen, self.setup_rx.is_some());
+        if want && self.sleep_guard.is_none() {
+            self.sleep_guard = Some(SleepGuard::acquire("Gravando/processando áudio"));
+        } else if !want {
+            self.sleep_guard = None;
         }
     }
 
@@ -205,6 +313,7 @@ impl App {
         } else {
             self.setup_rx = None;
             self.screen = Screen::Idle;
+            self.refresh_pending();
             self.start_monitor();
         }
     }
@@ -303,18 +412,34 @@ impl App {
     }
 
     fn start_recording(&mut self) {
-        let Some(dir) = self.ensure_output_dir() else { return };
+        if self.ensure_output_dir().is_none() {
+            return;
+        }
+        // Sem ffmpeg a gravação não viraria texto: avisa antes de gravar.
+        if let Err(e) = decode::check_ffmpeg() {
+            self.monitor = None;
+            self.screen = Screen::Error(format!("{e:#}"));
+            return;
+        }
         let Some(mic) = self.selected_mic() else { return };
+        if let Err(e) = std::fs::create_dir_all(&self.recordings_dir) {
+            self.monitor = None;
+            self.screen = Screen::Error(format!(
+                "Não foi possível criar {}: {e}",
+                self.recordings_dir.display()
+            ));
+            return;
+        }
         self.monitor = None; // o Recorder abre o próprio stream
-        let wav = temp_wav_path(&dir, chrono::Local::now().naive_local());
+        let wav = temp_wav_path(&self.recordings_dir, chrono::Local::now().naive_local());
         match Recorder::start(&mic, wav) {
             Ok(r) => self.screen = Screen::Recording(r),
             Err(e) => self.screen = Screen::Error(format!("Não foi possível gravar: {e:#}")),
         }
     }
 
-    /// Para a gravação e processa o que foi capturado.
-    fn stop_recording(&mut self, mic_lost: bool) {
+    /// Para a gravação e processa o que foi capturado. `failure`: por que parou sozinha.
+    fn stop_recording(&mut self, failure: Option<Failure>) {
         let Screen::Recording(rec) = std::mem::replace(&mut self.screen, Screen::Idle) else {
             return;
         };
@@ -326,9 +451,8 @@ impl App {
                 return;
             }
         }
-        let name = file_name_of(&wav);
-        let note = mic_lost.then(|| "O microfone desconectou; processando o que foi gravado".to_string());
-        self.start_processing(Source::Recording { wav, started_at }, name, note);
+        let note = failure.map(|f| f.note().to_string());
+        self.start_processing(Source::Recording { wav, started_at }, recording_title(started_at), note);
     }
 
     fn open_file(&mut self, path: PathBuf) {
@@ -354,11 +478,13 @@ impl App {
         matches!(self.screen, Screen::Recording(_) | Screen::Processing(_))
     }
 
-    /// Botão "Fechar" do modal. Gravando, finaliza o WAV antes.
+    /// Botão "Fechar" do modal. Gravando, finaliza o WAV em `gravacoes/` (oferecido na
+    /// próxima abertura).
     fn close_now(&mut self, ctx: &egui::Context) {
         if let Screen::Recording(rec) = std::mem::replace(&mut self.screen, Screen::Idle) {
             let _ = rec.stop();
         }
+        self.sleep_guard = None;
         self.force_close = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -366,11 +492,12 @@ impl App {
     fn show_close_modal(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let mut keep = false;
+        let recording = matches!(self.screen, Screen::Recording(_));
         egui::Modal::new(egui::Id::unique("confirm_close")).show(ctx, |ui| {
             ui.set_width(300.0);
-            ui.heading("Fechar agora?");
+            ui.heading("Fechar?");
             ui.add_space(6.0);
-            ui.label("O processamento será perdido, mas o áudio continua salvo.");
+            ui.label(close_message(recording));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("Fechar").clicked() {
@@ -385,6 +512,31 @@ impl App {
             self.close_now(ctx);
         } else if keep {
             self.confirm_close = false;
+        }
+    }
+
+    fn show_discard_modal(&mut self, ctx: &egui::Context) {
+        let mut discard = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("confirm_discard")).show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.heading("Descartar a gravação?");
+            ui.add_space(6.0);
+            ui.label("O áudio será apagado e não dá para desfazer.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Descartar").clicked() {
+                    discard = true;
+                }
+                if ui.button("Cancelar").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if discard {
+            self.discard_confirmed();
+        } else if cancel {
+            self.confirm_discard = None;
         }
     }
 }
@@ -421,8 +573,8 @@ impl eframe::App for App {
 
         // microfone sumiu durante a gravação: para e processa o que existe
         if let Screen::Recording(rec) = &self.screen {
-            if rec.failed().is_some() {
-                self.stop_recording(true);
+            if let Some(f) = rec.failed() {
+                self.stop_recording(Some(f));
             }
         }
 
@@ -445,7 +597,10 @@ impl eframe::App for App {
 
         if self.confirm_close {
             self.show_close_modal(&ctx);
+        } else if self.confirm_discard.is_some() {
+            self.show_discard_modal(&ctx);
         }
+        self.sync_sleep_guard();
 
         let animated = matches!(
             self.screen,
@@ -549,6 +704,75 @@ mod tests {
             estimate_remaining(Duration::from_secs(60), 0.5),
             Some(Duration::from_secs(60))
         );
+    }
+
+    fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 28).unwrap().and_hms_opt(h, m, 5).unwrap()
+    }
+
+    #[test]
+    fn recording_title_uses_the_start_time() {
+        assert_eq!(recording_title(at(9, 5)), "Gravação de 09:05");
+    }
+
+    #[test]
+    fn pending_label_text() {
+        assert_eq!(
+            pending_label(at(14, 30), Some(720_000)),
+            "Gravação não processada de 28/10/2026 14:30 (12 min)"
+        );
+        assert_eq!(pending_label(at(14, 30), None), "Gravação não processada de 28/10/2026 14:30");
+    }
+
+    #[test]
+    fn close_message_depends_on_state() {
+        assert_eq!(
+            close_message(true),
+            "Parar a gravação e fechar? O áudio fica salvo e você pode processar depois."
+        );
+        assert_eq!(
+            close_message(false),
+            "Fechar agora? O processamento será perdido, mas o áudio continua salvo."
+        );
+    }
+
+    #[test]
+    fn inhibit_only_while_busy() {
+        assert!(inhibit_wanted(&Screen::Processing(ProcessingState::new("x".into(), None)), false));
+        assert!(inhibit_wanted(&Screen::Setup(SetupState::default()), true));
+        assert!(!inhibit_wanted(&Screen::Setup(SetupState::default()), false));
+        assert!(!inhibit_wanted(&Screen::Idle, false));
+        assert!(!inhibit_wanted(&Screen::Done(Outcome { md_path: "/a.md".into(), speakers: 1, duration_ms: 1 }), false));
+        assert!(!inhibit_wanted(&Screen::Error("x".into()), false));
+    }
+
+    #[test]
+    fn discarding_a_pending_recording_asks_first_then_deletes() {
+        let d = tempfile::tempdir().unwrap();
+        let wav = d.path().join("gravacao-20261028-143005.wav");
+        std::fs::write(&wav, b"x").unwrap();
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.pending = vec![Pending { wav: wav.clone(), started_at: at(14, 30), duration_ms: None }];
+        app.request_discard(0);
+        assert_eq!(app.confirm_discard.as_deref(), Some(wav.as_path()));
+        assert!(wav.exists(), "só apaga depois de confirmar");
+        app.discard_confirmed();
+        assert!(!wav.exists());
+        assert!(app.pending.is_empty());
+        assert!(app.confirm_discard.is_none());
+    }
+
+    #[test]
+    fn refresh_pending_lists_leftover_wavs() {
+        let d = tempfile::tempdir().unwrap();
+        let wav = crate::audio::record::temp_wav_path(d.path(), at(14, 30));
+        std::fs::write(&wav, b"x").unwrap();
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.recordings_dir = d.path().to_path_buf();
+        app.refresh_pending();
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].wav, wav);
+        assert_eq!(app.pending[0].started_at, at(14, 30));
     }
 
     #[test]

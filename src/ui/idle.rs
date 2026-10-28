@@ -16,6 +16,26 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
     let mut open_dialog = false;
     let mut change_dir = false;
 
+    let mut process_pending: Option<usize> = None;
+    let mut discard_pending: Option<usize> = None;
+    if !recording && !app.pending.is_empty() {
+        for (i, p) in app.pending.iter().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    super::pending_label(p.started_at, p.duration_ms),
+                );
+                if ui.button("Processar").clicked() {
+                    process_pending = Some(i);
+                }
+                if ui.button("Descartar").clicked() {
+                    discard_pending = Some(i);
+                }
+            });
+        }
+        ui.separator();
+    }
+
     ui.label("Microfone");
     let current = app.selected_mic().unwrap_or_else(|| "(nenhum)".into());
     ui.add_enabled_ui(!recording, |ui| {
@@ -117,9 +137,16 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
     if change_dir {
         app.pick_output_dir();
     }
+    if let Some(i) = process_pending {
+        app.process_pending(i);
+        return;
+    }
+    if let Some(i) = discard_pending {
+        app.request_discard(i);
+    }
     if toggle_record {
         if recording {
-            app.stop_recording(false);
+            app.stop_recording(None);
         } else {
             app.start_recording();
         }
