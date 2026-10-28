@@ -19,15 +19,49 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Nomes dos microfones disponíveis (host padrão).
+/// Dispositivos que não são microfone de verdade (o `null` do ALSA grava silêncio).
+fn is_unusable(name: &str) -> bool {
+    name.starts_with("Discard all samples")
+}
+
+/// Padrão primeiro, depois os demais na ordem original; sem duplicatas e sem `null`.
+fn order_devices(all: Vec<String>, default: Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |n: String| {
+        if !is_unusable(&n) && !out.contains(&n) {
+            out.push(n);
+        }
+    };
+    if let Some(d) = &default
+        && all.contains(d)
+    {
+        push(d.clone());
+    }
+    for n in all {
+        push(n);
+    }
+    out
+}
+
+/// Nomes dos microfones disponíveis (host padrão), o padrão do sistema primeiro.
 pub fn list_input_devices() -> Vec<String> {
     let host = cpal::default_host();
     let Ok(devices) = host.input_devices() else {
         return Vec::new();
     };
-    devices
-        .filter_map(|d| d.description().ok().map(|d| d.name().to_string()))
-        .collect()
+    let default_id = host.default_input_device().and_then(|d| d.id().ok());
+    let mut default_name = None;
+    let mut all = Vec::new();
+    for d in devices {
+        let Ok(desc) = d.description() else { continue };
+        let name = desc.name().to_string();
+        // o padrão é achado pelo id: o nome do próprio "default" não aparece na lista
+        if default_name.is_none() && default_id.is_some() && d.id().ok() == default_id {
+            default_name = Some(name.clone());
+        }
+        all.push(name);
+    }
+    order_devices(all, default_name)
 }
 
 /// Últimos ~300 valores de pico (0..1), um a cada ~33 ms.
@@ -346,6 +380,42 @@ impl Recorder {
 
 #[cfg(test)]
 mod tests {
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn padrao_vem_primeiro_e_null_some() {
+        let all = v(&["Discard all samples (playback) or generate zero samples (capture)", "PipeWire", "Padrao", "HDA"]);
+        assert_eq!(order_devices(all, Some("Padrao".into())), v(&["Padrao", "PipeWire", "HDA"]));
+    }
+
+    #[test]
+    fn sem_duplicatas() {
+        let all = v(&["HDA", "HDA", "Padrao", "Padrao"]);
+        assert_eq!(order_devices(all, Some("Padrao".into())), v(&["Padrao", "HDA"]));
+    }
+
+    #[test]
+    fn sem_padrao_mantem_ordem_sem_null() {
+        let all = v(&["Discard all samples (x)", "B", "A"]);
+        assert_eq!(order_devices(all.clone(), None), v(&["B", "A"]));
+        assert_eq!(order_devices(all, Some("fora da lista".into())), v(&["B", "A"]));
+    }
+
+    #[test]
+    fn padrao_null_nao_e_usado() {
+        let all = v(&["Discard all samples (x)", "B"]);
+        assert_eq!(order_devices(all, Some("Discard all samples (x)".into())), v(&["B"]));
+    }
+
+    #[test]
+    fn is_unusable_so_pega_null() {
+        assert!(is_unusable("Discard all samples (playback) or generate zero samples (capture)"));
+        assert!(!is_unusable("HDA Intel PCH, ALC257 Analog"));
+        assert!(!is_unusable("PipeWire Sound Server"));
+    }
+
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
