@@ -6,7 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
-serde_json = "1"
+cpal = "0.18.2"
+dirs = "7.0.0"
+hound = "3.5.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3"
