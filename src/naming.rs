@@ -61,14 +61,25 @@ pub fn resolve_recorded_at(
 }
 
 /// Stem `AAAA-MM-DD-HHMM`, com `-2`, `-3`... se `.md` ou `.ogg` já existir em `dir`.
-pub fn unique_output_stem(dir: &Path, at: NaiveDateTime) -> anyhow::Result<String> {
+/// `source` (o áudio de origem) não conta como ocupando o nome: reprocessar
+/// `2026-10-28-1430.ogg` gera `2026-10-28-1430.md`.
+pub fn unique_output_stem(
+    dir: &Path,
+    at: NaiveDateTime,
+    source: Option<&Path>,
+) -> anyhow::Result<String> {
     if !dir.is_dir() {
         bail!("a pasta de saída não existe: {}", dir.display());
     }
     let base = at.format("%Y-%m-%d-%H%M").to_string();
+    let source = source.and_then(|p| p.canonicalize().ok());
+    let is_source = |p: &Path| source.is_some() && p.canonicalize().ok() == source;
     let taken = |stem: &str| -> anyhow::Result<bool> {
         for ext in ["md", "ogg"] {
             let path = dir.join(format!("{stem}.{ext}"));
+            if is_source(&path) {
+                continue;
+            }
             if path
                 .try_exists()
                 .with_context(|| format!("não foi possível verificar {}", path.display()))?
@@ -162,7 +173,7 @@ mod tests {
     fn unique_first_is_plain() {
         let tmp = tempfile::tempdir().unwrap();
         let at = dt(2026, 10, 28, 14, 30, 0);
-        assert_eq!(unique_output_stem(tmp.path(), at).unwrap(), "2026-10-28-1430");
+        assert_eq!(unique_output_stem(tmp.path(), at, None).unwrap(), "2026-10-28-1430");
     }
 
     #[test]
@@ -172,15 +183,31 @@ mod tests {
         std::fs::write(tmp.path().join("2026-10-28-1430-2.ogg"), "").unwrap();
         let at = dt(2026, 10, 28, 14, 30, 0);
         assert_eq!(
-            unique_output_stem(tmp.path(), at).unwrap(),
+            unique_output_stem(tmp.path(), at, None).unwrap(),
             "2026-10-28-1430-3"
         );
+    }
+
+    #[test]
+    fn reprocessing_own_ogg_keeps_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ogg = tmp.path().join("2026-10-28-1430.ogg");
+        std::fs::write(&ogg, "").unwrap();
+        let at = dt(2026, 10, 28, 14, 30, 0);
+        // o próprio arquivo de origem não ocupa o nome
+        assert_eq!(unique_output_stem(tmp.path(), at, Some(&ogg)).unwrap(), "2026-10-28-1430");
+        // caminho equivalente (com ./) também conta como o mesmo arquivo
+        let alt = tmp.path().join(".").join("2026-10-28-1430.ogg");
+        assert_eq!(unique_output_stem(tmp.path(), at, Some(&alt)).unwrap(), "2026-10-28-1430");
+        // mas um .md existente ainda ocupa
+        std::fs::write(tmp.path().join("2026-10-28-1430.md"), "").unwrap();
+        assert_eq!(unique_output_stem(tmp.path(), at, Some(&ogg)).unwrap(), "2026-10-28-1430-2");
     }
 
     #[test]
     fn unique_errors_on_missing_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let at = dt(2026, 10, 28, 14, 30, 0);
-        assert!(unique_output_stem(&tmp.path().join("nao-existe"), at).is_err());
+        assert!(unique_output_stem(&tmp.path().join("nao-existe"), at, None).is_err());
     }
 }

@@ -166,7 +166,7 @@ fn execute(
             resolve_recorded_at(info.creation_time, &name, mtime)
         }
     };
-    let stem = unique_output_stem(&job.output_dir, recorded_at)?;
+    let stem = unique_output_stem(&job.output_dir, recorded_at, Some(&input))?;
     let samples = decode::decode_16k_mono(&input)?;
 
     let source_name = if recording.is_some() {
