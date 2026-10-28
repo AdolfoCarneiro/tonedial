@@ -130,8 +130,16 @@ pub fn decode_16k_mono(path: &Path) -> Result<Vec<f32>> {
 }
 
 pub fn encode_ogg(wav: &Path, out: &Path) -> Result<()> {
+    encode_ogg_with(&ffmpeg_bin(), wav, out)
+}
+
+/// Escreve em `<out>.part` e só renomeia no fim: um .ogg nunca fica pela metade.
+fn encode_ogg_with(bin: &str, wav: &Path, out: &Path) -> Result<()> {
+    let mut part = out.as_os_str().to_owned();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
     let res = run(
-        &ffmpeg_bin(),
+        bin,
         &[
             "-v".as_ref(),
             "error".as_ref(),
@@ -144,16 +152,29 @@ pub fn encode_ogg(wav: &Path, out: &Path) -> Result<()> {
             "64k".as_ref(),
             "-ac".as_ref(),
             "1".as_ref(),
-            out.as_os_str(),
+            "-f".as_ref(),
+            "ogg".as_ref(),
+            part.as_os_str(),
         ],
-    )?;
+    );
+    let res = match res {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
     if !res.status.success() {
+        let _ = std::fs::remove_file(&part);
         bail!(
             "Não consegui gerar o .ogg: {}",
             String::from_utf8_lossy(&res.stderr).trim()
         );
     }
-    Ok(())
+    std::fs::rename(&part, out).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        anyhow!("Não consegui gerar o .ogg: {e}")
+    })
 }
 
 #[cfg(test)]
@@ -195,6 +216,33 @@ mod tests {
         assert!(out.exists());
         let ms = probe(&out).unwrap().duration_ms;
         assert!((1900..=2100).contains(&ms), "{ms}");
+    }
+
+    #[test]
+    fn encode_ogg_leaves_no_part_on_success() {
+        let d = tempfile::tempdir().unwrap();
+        let src = fixture(d.path());
+        let out = d.path().join("out.ogg");
+        encode_ogg(&src, &out).unwrap();
+        assert!(out.is_file());
+        assert!(!d.path().join("out.ogg.part").exists());
+    }
+
+    #[test]
+    fn failed_encode_leaves_no_partial_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        // "ffmpeg" falso: escreve algo no arquivo de saída (último argumento) e falha.
+        let fake = d.path().join("ffmpeg-falso");
+        std::fs::write(&fake, "#!/bin/sh\nfor a; do last=$a; done\necho meio > \"$last\"\necho quebrou >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let src = d.path().join("in.wav");
+        std::fs::write(&src, "x").unwrap();
+        let out = d.path().join("out.ogg");
+        let e = encode_ogg_with(fake.to_str().unwrap(), &src, &out).unwrap_err();
+        assert!(e.to_string().contains("Não consegui gerar o .ogg"), "{e}");
+        assert!(!out.exists());
+        assert!(!d.path().join("out.ogg.part").exists());
     }
 
     #[test]
