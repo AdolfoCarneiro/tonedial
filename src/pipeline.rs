@@ -10,7 +10,7 @@ use crate::audio::decode;
 use crate::diarize::{Diarizer, SpeakrsDiarizer};
 use crate::models::{VAD_MODEL_FILE, WHISPER_MODEL_FILE};
 use crate::naming::{resolve_recorded_at, unique_output_stem};
-use crate::transcript::{Header, align, render_markdown};
+use crate::transcript::{Header, Word, align, render_markdown};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -57,7 +57,12 @@ pub struct Job {
 /// Fábrica do diarizador; chamada só depois de o whisper ter sido solto da memória.
 pub type DiarizerFactory<'a> = Box<dyn FnOnce() -> Result<Box<dyn Diarizer>> + Send + 'a>;
 
-const CPU_NOTICE: &str = "Sem memória na GPU, usando CPU (mais lento)";
+/// Transcrição injetável (o padrão carrega o whisper); recebe as amostras 16 kHz mono.
+pub(crate) type Transcriber<'a> =
+    Box<dyn FnOnce(&[f32], &Sender<Progress>) -> Result<Vec<Word>> + 'a>;
+
+const CPU_NOTICE: &str = "GPU indisponível ou sem memória livre; usando CPU (mais lento)";
+pub(crate) const DIARIZE_FAILED_NOTICE: &str = "Não consegui separar os falantes; o texto sai sem separação.";
 
 /// Roda o pipeline completo com whisper padrão e speakrs. Bloqueante: o chamador põe numa thread.
 /// Sempre termina enviando `Done` ou `Failed`.
@@ -72,31 +77,68 @@ pub fn run(job: Job, tx: Sender<Progress>) {
 
 /// Como `run`, mas com o caminho do modelo do whisper e o diarizador escolhidos (usado pelo CLI).
 pub fn run_with(job: Job, model_path: &Path, make_diarizer: DiarizerFactory, tx: Sender<Progress>) {
-    run_inner(job, model_path, make_diarizer, decode::check_ffmpeg, tx);
+    let vad = job.models_dir.join(VAD_MODEL_FILE);
+    let transcriber: Transcriber = Box::new(move |samples, tx| whisper_transcribe(model_path, &vad, samples, tx));
+    run_inner(job, transcriber, make_diarizer, decode::check_ffmpeg, tx);
+}
+
+/// Whisper: o modelo é solto ao fim desta função, antes de diarizar (VRAM).
+fn whisper_transcribe(
+    model_path: &Path,
+    vad: &Path,
+    samples: &[f32],
+    tx: &Sender<Progress>,
+) -> Result<Vec<Word>> {
+    let mut model = asr::load_model(model_path).context("Falha ao carregar o modelo de transcrição")?;
+    let mut notified = false;
+    if model.device == Device::Cpu {
+        let _ = tx.send(Progress::Notice(CPU_NOTICE.into()));
+        notified = true;
+    }
+    let ptx = tx.clone();
+    let words = asr::transcribe(&mut model, model_path, vad, samples, move |f| {
+        let _ = ptx.send(Progress::Fraction(f));
+    })?;
+    if !notified && model.device == Device::Cpu {
+        let _ = tx.send(Progress::Notice(CPU_NOTICE.into()));
+    }
+    Ok(words)
 }
 
 fn run_inner(
     job: Job,
-    model_path: &Path,
+    transcribe: Transcriber,
     make_diarizer: DiarizerFactory,
     check: impl FnOnce() -> Result<()>,
     tx: Sender<Progress>,
 ) {
-    match execute(job, model_path, make_diarizer, check, &tx) {
+    let wav = match &job.source {
+        Source::Recording { wav, .. } => Some(wav.clone()),
+        Source::File(_) => None,
+    };
+    let mut ogg: Option<PathBuf> = None;
+    match execute(job, transcribe, make_diarizer, check, &mut ogg, &tx) {
         Ok(outcome) => {
             let _ = tx.send(Progress::Done(outcome));
         }
         Err(e) => {
-            let _ = tx.send(Progress::Failed(format!("{e:#}")));
+            let mut msg = format!("{e:#}");
+            // Gravação: diz onde o áudio ficou (o .ogg, se já existe; senão o WAV).
+            if let Some(wav) = wav {
+                let saved = ogg.filter(|o| o.is_file()).unwrap_or(wav);
+                msg.push_str(&format!("\nO áudio está salvo em: {}", saved.display()));
+            }
+            let _ = tx.send(Progress::Failed(msg));
         }
     }
 }
 
 fn execute(
     job: Job,
-    model_path: &Path,
+    transcribe: Transcriber,
     make_diarizer: DiarizerFactory,
     check: impl FnOnce() -> Result<()>,
+    saved_ogg: &mut Option<PathBuf>,
     tx: &Sender<Progress>,
 ) -> Result<Outcome> {
     let send = |p: Progress| {
@@ -132,6 +174,7 @@ fn execute(
         decode::encode_ogg(&input, &ogg)?;
         if ogg.exists() {
             let _ = std::fs::remove_file(&input);
+            *saved_ogg = Some(ogg);
         }
         format!("{stem}.ogg")
     } else {
@@ -141,29 +184,31 @@ fn execute(
             .unwrap_or_default()
     };
 
-    // Whisper: o modelo é solto ao fim deste bloco, antes de diarizar (VRAM).
     send(Progress::Stage(Stage::Transcribing));
-    let words = {
-        let mut model = asr::load_model(model_path).context("Falha ao carregar o modelo de transcrição")?;
-        let mut notified = false;
-        if model.device == Device::Cpu {
-            send(Progress::Notice(CPU_NOTICE.into()));
-            notified = true;
-        }
-        let vad = job.models_dir.join(VAD_MODEL_FILE);
-        let ptx = tx.clone();
-        let words = asr::transcribe(&mut model, model_path, &vad, &samples, move |f| {
-            let _ = ptx.send(Progress::Fraction(f));
-        })?;
-        if !notified && model.device == Device::Cpu {
-            send(Progress::Notice(CPU_NOTICE.into()));
-        }
-        words
-    };
+    let words = transcribe(&samples, tx)?;
 
-    send(Progress::Stage(Stage::Diarizing));
-    let diarizer = make_diarizer()?;
-    let segments = diarizer.diarize(&samples, &mut |f| send(Progress::Fraction(f)))?;
+    // Falha (ou panic) na separação não joga fora a transcrição: tudo vira Falante 1.
+    let segments = if words.is_empty() {
+        Vec::new()
+    } else {
+        send(Progress::Stage(Stage::Diarizing));
+        let diarized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let diarizer = make_diarizer()?;
+            diarizer.diarize(&samples, &mut |f| send(Progress::Fraction(f)))
+        }));
+        match diarized {
+            Ok(Ok(segments)) => segments,
+            Ok(Err(e)) => {
+                eprintln!("separação de falantes falhou: {e:#}");
+                send(Progress::Notice(DIARIZE_FAILED_NOTICE.into()));
+                Vec::new()
+            }
+            Err(_) => {
+                send(Progress::Notice(DIARIZE_FAILED_NOTICE.into()));
+                Vec::new()
+            }
+        }
+    };
 
     send(Progress::Stage(Stage::Writing));
     let utterances = align(&words, &segments);
@@ -192,6 +237,144 @@ mod tests {
         Box::new(|| anyhow::bail!("não deveria chegar aqui"))
     }
 
+    fn no_transcriber<'a>() -> Transcriber<'a> {
+        Box::new(|_, _| anyhow::bail!("não deveria chegar aqui"))
+    }
+
+    fn words_transcriber<'a>() -> Transcriber<'a> {
+        Box::new(|_, _| {
+            Ok(vec![
+                Word { start_ms: 0, end_ms: 400, text: "olá".into() },
+                Word { start_ms: 500, end_ms: 900, text: "mundo".into() },
+            ])
+        })
+    }
+
+    /// WAV de 2 s (tom) gerado pelo ffmpeg.
+    fn wav_fixture(dir: &Path) -> PathBuf {
+        let p = dir.join("gravacao.wav");
+        let st = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        p
+    }
+
+    fn started() -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 28).unwrap().and_hms_opt(14, 30, 0).unwrap()
+    }
+
+    #[test]
+    fn diarizer_error_falls_back_to_single_speaker() {
+        let d = tempfile::tempdir().unwrap();
+        let audio = wav_fixture(d.path());
+        let out = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            source: Source::File(audio),
+            output_dir: out.path().to_path_buf(),
+            models_dir: d.path().to_path_buf(),
+        };
+        run_inner(job, words_transcriber(), Box::new(|| anyhow::bail!("sem modelo")), || Ok(()), tx);
+        let msgs: Vec<Progress> = rx.try_iter().collect();
+        assert!(
+            msgs.iter().any(|m| matches!(m, Progress::Notice(n) if n == DIARIZE_FAILED_NOTICE)),
+            "{msgs:?}"
+        );
+        let Some(Progress::Done(o)) = msgs.last() else { panic!("esperava Done: {msgs:?}") };
+        assert_eq!(o.speakers, 1);
+        let md = std::fs::read_to_string(&o.md_path).unwrap();
+        assert!(md.contains("olá mundo"), "{md}");
+    }
+
+    #[test]
+    fn diarizer_panic_falls_back_to_single_speaker() {
+        let d = tempfile::tempdir().unwrap();
+        let audio = wav_fixture(d.path());
+        let out = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            source: Source::File(audio),
+            output_dir: out.path().to_path_buf(),
+            models_dir: d.path().to_path_buf(),
+        };
+        run_inner(job, words_transcriber(), Box::new(|| panic!("boom")), || Ok(()), tx);
+        let msgs: Vec<Progress> = rx.try_iter().collect();
+        assert!(msgs.iter().any(|m| matches!(m, Progress::Notice(n) if n == DIARIZE_FAILED_NOTICE)));
+        let Some(Progress::Done(o)) = msgs.last() else { panic!("esperava Done: {msgs:?}") };
+        assert!(o.md_path.is_file());
+    }
+
+    #[test]
+    fn no_words_skips_diarization() {
+        let d = tempfile::tempdir().unwrap();
+        let audio = wav_fixture(d.path());
+        let out = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            source: Source::File(audio),
+            output_dir: out.path().to_path_buf(),
+            models_dir: d.path().to_path_buf(),
+        };
+        run_inner(job, Box::new(|_, _| Ok(vec![])), Box::new(|| panic!("não devia diarizar")), || Ok(()), tx);
+        let msgs: Vec<Progress> = rx.try_iter().collect();
+        assert!(!msgs.iter().any(|m| matches!(m, Progress::Stage(Stage::Diarizing) | Progress::Notice(_))), "{msgs:?}");
+        assert!(matches!(msgs.last(), Some(Progress::Done(_))), "{msgs:?}");
+    }
+
+    #[test]
+    fn recording_failure_before_ogg_says_where_the_wav_is() {
+        let d = tempfile::tempdir().unwrap();
+        let wav = wav_fixture(d.path());
+        let out = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            source: Source::Recording { wav: wav.clone(), started_at: started() },
+            output_dir: out.path().to_path_buf(),
+            models_dir: d.path().to_path_buf(),
+        };
+        run_inner(job, no_transcriber(), no_diarizer(), || decode::check_ffmpeg_at("/nao/existe"), tx);
+        let Some(Progress::Failed(m)) = rx.try_iter().last() else { panic!("esperava Failed") };
+        assert!(m.starts_with("ffmpeg não encontrado"), "{m}");
+        assert!(m.ends_with(&format!("\nO áudio está salvo em: {}", wav.display())), "{m}");
+        assert!(wav.is_file());
+    }
+
+    #[test]
+    fn recording_failure_after_ogg_says_where_the_ogg_is() {
+        let d = tempfile::tempdir().unwrap();
+        let wav = wav_fixture(d.path());
+        let out = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            source: Source::Recording { wav: wav.clone(), started_at: started() },
+            output_dir: out.path().to_path_buf(),
+            models_dir: d.path().to_path_buf(),
+        };
+        run_inner(job, Box::new(|_, _| anyhow::bail!("whisper quebrou")), no_diarizer(), || Ok(()), tx);
+        let Some(Progress::Failed(m)) = rx.try_iter().last() else { panic!("esperava Failed") };
+        let ogg = out.path().join("2026-10-28-1430.ogg");
+        assert!(ogg.is_file());
+        assert!(!wav.exists());
+        assert!(m.ends_with(&format!("\nO áudio está salvo em: {}", ogg.display())), "{m}");
+    }
+
+    #[test]
+    fn file_failure_message_has_no_location() {
+        let d = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            source: Source::File(d.path().join("x.m4a")),
+            output_dir: d.path().to_path_buf(),
+            models_dir: d.path().to_path_buf(),
+        };
+        run_inner(job, no_transcriber(), no_diarizer(), || Ok(()), tx);
+        let Some(Progress::Failed(m)) = rx.try_iter().last() else { panic!("esperava Failed") };
+        assert!(!m.contains("O áudio está salvo em"), "{m}");
+    }
+
     #[test]
     fn missing_ffmpeg_reports_failed() {
         let (tx, rx) = mpsc::channel();
@@ -203,7 +386,7 @@ mod tests {
         // Equivale a TONEDIAL_FFMPEG=/nao/existe, sem mexer no ambiente do processo.
         run_inner(
             job,
-            Path::new("m.bin"),
+            no_transcriber(),
             no_diarizer(),
             || decode::check_ffmpeg_at("/nao/existe"),
             tx,
@@ -226,7 +409,7 @@ mod tests {
             output_dir: d.path().join("sumiu"),
             models_dir: d.path().to_path_buf(),
         };
-        run_inner(job, Path::new("m.bin"), no_diarizer(), || Ok(()), tx);
+        run_inner(job, no_transcriber(), no_diarizer(), || Ok(()), tx);
         assert!(matches!(rx.try_iter().last(), Some(Progress::Failed(_))));
     }
 
