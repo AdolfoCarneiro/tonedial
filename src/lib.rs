@@ -6,3 +6,4 @@ pub mod models;
 pub mod naming;
 pub mod pipeline;
 pub mod transcript;
+pub mod ui;
