@@ -6,3 +6,4 @@
 /models
 .env*
 .superpowers/
+.claude/worktrees/
