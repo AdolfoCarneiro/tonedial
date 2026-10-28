@@ -16,6 +16,10 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
     let mut open_dialog = false;
     let mut change_dir = false;
 
+    if let Some(w) = &app.setup_warning {
+        ui.colored_label(ui.visuals().warn_fg_color, w);
+        ui.add_space(4.0);
+    }
     let mut process_pending: Option<usize> = None;
     let mut discard_pending: Option<usize> = None;
     if !recording && !app.pending.is_empty() {

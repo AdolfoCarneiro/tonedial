@@ -108,6 +108,8 @@ pub struct App {
     /// WAV pendente esperando confirmação de "Descartar".
     confirm_discard: Option<PathBuf>,
     sleep_guard: Option<SleepGuard>,
+    /// Aviso da preparação dos modelos (ex.: não apagou o f16), mostrado no Idle.
+    setup_warning: Option<String>,
 }
 
 /// Título da tela de processamento de uma gravação.
@@ -194,6 +196,7 @@ impl App {
             pending: Vec::new(),
             confirm_discard: None,
             sleep_guard: None,
+            setup_warning: None,
         }
     }
 
@@ -339,6 +342,7 @@ impl App {
                         s.quantizing = true;
                     }
                 }
+                SetupProgress::Warning(w) => self.setup_warning = Some(w),
                 SetupProgress::Finished => {
                     self.setup_rx = None;
                     self.go_idle();

@@ -134,6 +134,8 @@ pub fn missing_models(dir: &Path) -> Vec<ModelFile> {
 pub enum SetupProgress {
     Downloading { file: String, done: u64, total: u64 },
     Quantizing,
+    /// Algo deu errado, mas o modelo está pronto para uso.
+    Warning(String),
     Finished,
     Failed(String),
 }
@@ -238,13 +240,23 @@ fn prepare_whisper(dir: &Path, tx: &Sender<SetupProgress>) -> Result<()> {
                 let _ = std::fs::remove_file(&part);
                 return Err(e.context("Falha ao quantizar o modelo do Whisper"));
             }
-            std::fs::rename(&part, &dest)
-                .with_context(|| format!("Não foi possível gravar {}", dest.display()))?;
-            std::fs::remove_file(&source)
-                .with_context(|| format!("Não foi possível apagar {}", source.display()))?;
-            Ok(())
+            finish_quantization(&part, &dest, &source, tx)
         }
     }
+}
+
+/// Põe o modelo quantizado no lugar e apaga o f16. Se não der para apagar o f16, só
+/// avisa: o modelo já está pronto.
+fn finish_quantization(part: &Path, dest: &Path, source: &Path, tx: &Sender<SetupProgress>) -> Result<()> {
+    std::fs::rename(part, dest)
+        .with_context(|| format!("Não foi possível gravar {}", dest.display()))?;
+    if let Err(e) = std::fs::remove_file(source) {
+        let _ = tx.send(SetupProgress::Warning(format!(
+            "Não consegui apagar {} ({e}); pode apagar à mão para liberar espaço.",
+            source.display()
+        )));
+    }
+    Ok(())
 }
 
 fn download_reporting(url: &str, dest: &Path, name: &str, tx: &Sender<SetupProgress>) -> Result<()> {
@@ -676,6 +688,25 @@ mod tests {
         run_setup(dir.path(), tx, |_, _| panic!("boom"));
         let msgs: Vec<_> = rx.iter().collect();
         assert_eq!(msgs, vec![SetupProgress::Failed("Erro inesperado: boom".into())]);
+    }
+
+    #[test]
+    fn failing_to_delete_f16_is_only_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("q8.bin.part");
+        let dest = dir.path().join("q8.bin");
+        std::fs::write(&part, b"q").unwrap();
+        // um diretório no lugar do f16: remove_file falha
+        let source = dir.path().join("f16.bin");
+        std::fs::create_dir(&source).unwrap();
+        let (tx, rx) = mpsc::channel();
+        finish_quantization(&part, &dest, &source, &tx).unwrap();
+        assert!(dest.is_file());
+        let msgs: Vec<_> = rx.try_iter().collect();
+        match msgs.as_slice() {
+            [SetupProgress::Warning(m)] => assert!(m.contains("f16.bin"), "{m}"),
+            other => panic!("esperava um Warning: {other:?}"),
+        }
     }
 
     #[test]
