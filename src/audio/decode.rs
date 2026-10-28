@@ -239,7 +239,12 @@ mod tests {
         let src = d.path().join("in.wav");
         std::fs::write(&src, "x").unwrap();
         let out = d.path().join("out.ogg");
-        let e = encode_ogg_with(fake.to_str().unwrap(), &src, &out).unwrap_err();
+        // Executar um script recém-escrito pode dar ETXTBSY se outra thread de teste fizer
+        // fork nesse instante; tenta de novo nesse caso.
+        let e = (0..50)
+            .map(|_| encode_ogg_with(fake.to_str().unwrap(), &src, &out).unwrap_err())
+            .find(|e| !e.to_string().contains("Text file busy"))
+            .expect("script sempre ocupado");
         assert!(e.to_string().contains("Não consegui gerar o .ogg"), "{e}");
         assert!(!out.exists());
         assert!(!d.path().join("out.ogg.part").exists());
