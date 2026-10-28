@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -140,11 +141,41 @@ pub enum SetupProgress {
 /// Baixa (e prepara) tudo o que falta em `dir`, informando o progresso em `tx`.
 /// Bloqueante: chamar numa thread. Sempre termina com `Finished` ou `Failed`.
 pub fn ensure_models(dir: &Path, tx: Sender<SetupProgress>) {
-    let msg = match prepare_models(dir, &tx) {
-        Ok(()) => SetupProgress::Finished,
-        Err(e) => SetupProgress::Failed(format!("{e:#}")),
+    run_setup(dir, tx, prepare_models);
+}
+
+/// Roda `prepare` e sempre envia `Finished` ou `Failed`, inclusive se ele der panic.
+fn run_setup(
+    dir: &Path,
+    tx: Sender<SetupProgress>,
+    prepare: impl FnOnce(&Path, &Sender<SetupProgress>) -> Result<()>,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(dir, &tx)));
+    let msg = match result {
+        Ok(Ok(())) => SetupProgress::Finished,
+        Ok(Err(e)) => SetupProgress::Failed(format!("{e:#}")),
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "falha interna".to_string());
+            SetupProgress::Failed(format!("Erro inesperado: {detail}"))
+        }
     };
     let _ = tx.send(msg);
+}
+
+/// Apaga `*.part` deixados por uma execução interrompida (liberam espaço e
+/// nunca são retomados).
+fn remove_part_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "part") && path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Folga além do estritamente necessário.
@@ -157,6 +188,7 @@ fn prepare_models(dir: &Path, tx: &Sender<SetupProgress>) -> Result<()> {
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Não foi possível criar a pasta de modelos {}", dir.display()))?;
+    remove_part_files(dir);
 
     // Tudo o que falta baixar + a saída da quantização (o f16 e o q8_0
     // coexistem no disco até o f16 ser apagado).
@@ -267,16 +299,42 @@ fn free_bytes(dir: &Path) -> Result<u64> {
 /// Baixa `url` para `dest.part` e renomeia para `dest` só ao terminar.
 /// Em erro, apaga o `.part`.
 fn download(url: &str, dest: &Path, on_progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    download_with(&http_agent(READ_TIMEOUT), url, dest, on_progress)
+}
+
+/// Sem dados por este tempo, a conexão é considerada morta (o agente padrão
+/// do ureq não tem timeout de leitura e travaria para sempre).
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn http_agent(read_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(read_timeout)
+        .build()
+}
+
+fn download_with(
+    agent: &ureq::Agent,
+    url: &str,
+    dest: &Path,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<()> {
     let part = part_path(dest);
-    if let Err(e) = download_to(url, &part, on_progress) {
+    if let Err(e) = download_to(agent, url, &part, on_progress) {
         let _ = std::fs::remove_file(&part);
         return Err(e);
     }
     std::fs::rename(&part, dest).with_context(|| format!("Não foi possível gravar {}", dest.display()))
 }
 
-fn download_to(url: &str, path: &Path, on_progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
-    let resp = ureq::get(url)
+fn download_to(
+    agent: &ureq::Agent,
+    url: &str,
+    path: &Path,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<()> {
+    let resp = agent
+        .get(url)
         .call()
         .with_context(|| format!("Sem resposta de {url} (verifique a conexão)"))?;
     let total: Option<u64> = resp.header("Content-Length").and_then(|v| v.parse().ok());
@@ -420,6 +478,8 @@ pub fn quantize_whisper(src: &Path, dst: &Path, quant: QuantType) -> Result<()> 
             if src_type == f16_type {
                 f16.resize(nelements, 0);
                 inp.read_exact(as_bytes_mut(&mut f16)).context("Modelo truncado")?;
+                // Sem ggml_init: nesta versão do ggml a conversão fp16->fp32 é
+                // calculada (GGML_COMPUTE_FP16_TO_FP32), não usa tabela inicializada.
                 // SAFETY: os dois buffers têm `nelements` elementos.
                 unsafe {
                     sys::ggml_fp16_to_fp32_row(f16.as_ptr(), f32s.as_mut_ptr(), nelements as i64)
@@ -581,6 +641,54 @@ mod tests {
     }
 
     #[test]
+    fn stalled_download_times_out_and_leaves_no_model() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = [0u8; 1024];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nalguns bytes",
+                );
+                let _ = s.flush();
+                // Trava sem fechar a conexão.
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.bin");
+        let agent = http_agent(Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let r = download_with(&agent, &format!("http://{addr}/m.bin"), &dest, &mut |_, _| {});
+        assert!(r.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(!dest.exists());
+        assert!(!dir.path().join("model.bin.part").exists());
+    }
+
+    #[test]
+    fn panic_during_setup_sends_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        run_setup(dir.path(), tx, |_, _| panic!("boom"));
+        let msgs: Vec<_> = rx.iter().collect();
+        assert_eq!(msgs, vec![SetupProgress::Failed("Erro inesperado: boom".into())]);
+    }
+
+    #[test]
+    fn leftover_part_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ggml-large-v3.bin.part"), b"x").unwrap();
+        std::fs::write(dir.path().join(VAD_MODEL_FILE), b"x").unwrap();
+        remove_part_files(dir.path());
+        assert!(!dir.path().join("ggml-large-v3.bin.part").exists());
+        assert!(dir.path().join(VAD_MODEL_FILE).exists());
+    }
+
+    #[test]
     fn ensure_models_with_everything_present_finishes() {
         let dir = tempfile::tempdir().unwrap();
         for m in all_models() {
@@ -627,7 +735,7 @@ mod tests {
     #[test]
     fn quantized_tiny_loads_in_whisper() {
         let Some(tiny) = tiny_model() else {
-            eprintln!("sem rede: pulando quantized_tiny_loads_in_whisper");
+            eprintln!("SKIPPED: sem rede, pulando quantized_tiny_loads_in_whisper");
             return;
         };
         let dir = tempfile::tempdir().unwrap();
