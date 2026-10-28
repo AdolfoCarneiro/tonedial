@@ -24,6 +24,21 @@ fn is_unusable(name: &str) -> bool {
     name.starts_with("Discard all samples")
 }
 
+fn is_null_device(id: Option<&str>, name: &str) -> bool {
+    id == Some("alsa:null") || is_unusable(name)
+}
+
+/// Índice do candidato (id, nome) com esse nome; entre homônimos, o que tem o id do padrão.
+fn pick_device(cands: &[(Option<String>, String)], name: &str, default_id: Option<&str>) -> Option<usize> {
+    let by_name = |(_, n): &(Option<String>, String)| n == name;
+    if let Some(did) = default_id
+        && let Some(i) = cands.iter().position(|c| by_name(c) && c.0.as_deref() == Some(did))
+    {
+        return Some(i);
+    }
+    cands.iter().position(by_name)
+}
+
 /// Padrão primeiro, depois os demais na ordem original; sem duplicatas e sem `null`.
 fn order_devices(all: Vec<String>, default: Option<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -55,8 +70,13 @@ pub fn list_input_devices() -> Vec<String> {
     for d in devices {
         let Ok(desc) = d.description() else { continue };
         let name = desc.name().to_string();
-        // o padrão é achado pelo id: o nome do próprio "default" não aparece na lista
-        if default_name.is_none() && default_id.is_some() && d.id().ok() == default_id {
+        let id = d.id().ok();
+        if is_null_device(id.as_ref().map(|i| i.to_string()).as_deref(), &name) {
+            continue;
+        }
+        // O nome da descrição do padrão ("Default Audio Device") não está na lista;
+        // por isso o padrão é identificado pelo id e listado com o nome da sua entrada.
+        if default_name.is_none() && id == default_id {
             default_name = Some(name.clone());
         }
         all.push(name);
@@ -177,10 +197,19 @@ fn find_device(name: &str) -> anyhow::Result<cpal::Device> {
     if !name.is_empty()
         && let Ok(devices) = host.input_devices()
     {
-        for d in devices {
-            if d.description().map(|x| x.name() == name).unwrap_or(false) {
-                return Ok(d);
-            }
+        let devices: Vec<cpal::Device> = devices.collect();
+        let cands: Vec<(Option<String>, String)> = devices
+            .iter()
+            .map(|d| {
+                (
+                    d.id().ok().map(|i| i.to_string()),
+                    d.description().map(|x| x.name().to_string()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let default_id = host.default_input_device().and_then(|d| d.id().ok()).map(|i| i.to_string());
+        if let Some(i) = pick_device(&cands, name, default_id.as_deref()) {
+            return Ok(devices.into_iter().nth(i).expect("índice válido"));
         }
     }
     // microfone salvo sumiu (ou nome vazio): cai para o padrão
@@ -380,8 +409,31 @@ impl Recorder {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cand(id: &str, name: &str) -> (Option<String>, String) {
+        (Some(id.to_string()), name.to_string())
+    }
+
+    #[test]
+    fn pick_device_prefere_o_padrao_entre_nomes_iguais() {
+        let c = vec![cand("alsa:hw", "HDA"), cand("alsa:default", "HDA"), cand("x", "Outro")];
+        assert_eq!(pick_device(&c, "HDA", Some("alsa:default")), Some(1));
+        assert_eq!(pick_device(&c, "HDA", None), Some(0));
+        assert_eq!(pick_device(&c, "HDA", Some("outro-id")), Some(0));
+        assert_eq!(pick_device(&c, "Outro", Some("alsa:default")), Some(2));
+        assert_eq!(pick_device(&c, "Sumiu", Some("alsa:default")), None);
+    }
+
+    #[test]
+    fn null_tambem_por_id() {
+        assert!(is_null_device(Some("alsa:null"), "qualquer"));
+        assert!(is_null_device(None, "Discard all samples (x)"));
+        assert!(!is_null_device(Some("alsa:default"), "HDA"));
     }
 
     #[test]
@@ -416,7 +468,6 @@ mod tests {
         assert!(!is_unusable("PipeWire Sound Server"));
     }
 
-    use super::*;
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("td-{}-{}.wav", name, std::process::id()))
