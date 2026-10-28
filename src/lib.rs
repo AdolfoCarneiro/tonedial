@@ -2,6 +2,7 @@ pub mod asr;
 pub mod audio;
 pub mod config;
 pub mod diarize;
+pub mod inhibit;
 pub mod models;
 pub mod naming;
 pub mod pipeline;
