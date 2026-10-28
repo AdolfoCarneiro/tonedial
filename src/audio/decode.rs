@@ -7,6 +7,7 @@ use chrono::{DateTime, NaiveDateTime};
 
 const MISSING_FFMPEG: &str = "ffmpeg não encontrado. Instale com: sudo dnf install ffmpeg";
 
+#[derive(Debug, Clone)]
 pub struct ProbeInfo {
     pub duration_ms: u64,
     pub creation_time: Option<NaiveDateTime>,
@@ -61,6 +62,12 @@ pub fn check_ffmpeg() -> Result<()> {
     Ok(())
 }
 
+fn parse_creation_time<Tz: chrono::TimeZone>(s: &str, tz: &Tz) -> Option<NaiveDateTime> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(tz).naive_local())
+}
+
 pub fn probe(path: &Path) -> Result<ProbeInfo> {
     let out = run(
         &ffprobe_bin(),
@@ -83,10 +90,12 @@ pub fn probe(path: &Path) -> Result<ProbeInfo> {
         .as_str()
         .and_then(|d| d.parse().ok())
         .ok_or_else(|| unreadable(path))?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(unreadable(path));
+    }
     let creation_time = json["format"]["tags"]["creation_time"]
         .as_str()
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|dt| dt.naive_local());
+        .and_then(|t| parse_creation_time(t, &chrono::Local));
     Ok(ProbeInfo {
         duration_ms: (secs * 1000.0).round() as u64,
         creation_time,
@@ -186,6 +195,19 @@ mod tests {
         assert!(out.exists());
         let ms = probe(&out).unwrap().duration_ms;
         assert!((1900..=2100).contains(&ms), "{ms}");
+    }
+
+    #[test]
+    fn creation_time_converted_to_given_zone() {
+        let tz = chrono::FixedOffset::west_opt(3 * 3600).unwrap();
+        let got = parse_creation_time("2026-10-28T00:30:00.000000Z", &tz).unwrap();
+        let want = chrono::NaiveDate::from_ymd_opt(2026, 10, 27)
+            .unwrap()
+            .and_hms_opt(21, 30, 0)
+            .unwrap();
+        assert_eq!(got, want);
+        assert_eq!(parse_creation_time("lixo", &tz), None);
+        assert_eq!(parse_creation_time("", &tz), None);
     }
 
     #[test]
