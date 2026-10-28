@@ -5,3 +5,4 @@
 *.ogg
 /models
 .env*
+.superpowers/
