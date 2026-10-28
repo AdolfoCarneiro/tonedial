@@ -511,6 +511,13 @@ mod tests {
     }
 
     #[test]
+    fn punctuation_token_merges_into_previous_word() {
+        let tokens = vec![tok(" Bom", 0, 1), tok(",", 1, 2), tok(" vocês", 2, 3)];
+        let texts: Vec<String> = words_from_tokens(&tokens).into_iter().map(|w| w.text).collect();
+        assert_eq!(texts, vec!["Bom,", "vocês"]);
+    }
+
+    #[test]
     fn split_multibyte_token_is_reassembled() {
         let bytes = "ã".as_bytes();
         let tokens = vec![

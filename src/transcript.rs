@@ -36,10 +36,10 @@ fn normalize(text: &str) -> String {
 }
 
 /// Remove loops de repetição (alucinação típica do whisper em silêncio):
-/// um n-grama de 1 a 8 palavras repetido mais de 3 vezes seguidas fica só com a primeira ocorrência.
+/// um n-grama de 1 a 16 palavras fica só com a primeira ocorrência quando se repete em sequência:
+/// n ≤ 2 só com mais de 3 repetições (preserva "sim sim", "não, não, não"); n ≥ 3 com 3 ou mais.
 pub fn dedupe_repeats(words: Vec<Word>) -> Vec<Word> {
-    const MAX_N: usize = 8;
-    const MAX_REPS: usize = 3;
+    const MAX_N: usize = 16;
     let norm: Vec<String> = words.iter().map(|w| normalize(&w.text)).collect();
     let mut keep = vec![true; words.len()];
     let mut i = 0;
@@ -55,7 +55,8 @@ pub fn dedupe_repeats(words: Vec<Word>) -> Vec<Word> {
             {
                 reps += 1;
             }
-            if reps > MAX_REPS {
+            let min_reps = if n <= 2 { 4 } else { 3 };
+            if reps >= min_reps {
                 for k in keep.iter_mut().take(i + reps * n).skip(i + n) {
                     *k = false;
                 }
@@ -117,7 +118,10 @@ pub fn align(words: &[Word], segments: &[SpeakerSegment]) -> Vec<Utterance> {
             order.push(id);
         }
         match raw.last_mut() {
-            Some((last, _, text)) if *last == id => text.push_str(&w.text),
+            Some((last, _, text)) if *last == id => {
+                text.push(' ');
+                text.push_str(&w.text);
+            }
             _ => raw.push((id, w.start_ms, w.text.clone())),
         }
     }
@@ -242,6 +246,60 @@ mod tests {
 
         let w = vec![word(0, 10, "sim"), word(10, 20, " sim")];
         assert_eq!(dedupe_repeats(w.clone()), w);
+    }
+
+    fn words_of(text: &str, reps: usize) -> Vec<Word> {
+        let mut out = Vec::new();
+        for _ in 0..reps {
+            for t in text.split_whitespace() {
+                let s = out.len() as u64 * 10;
+                out.push(word(s, s + 10, t));
+            }
+        }
+        out
+    }
+    fn join(w: &[Word]) -> String {
+        w.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn dedupe_collapses_long_phrase_repeated_three_times() {
+        let mut w = words_of("Ah, eu já estou acabando com as minhas reservas.", 1);
+        w.extend(words_of("ah eu já estou acabando com as minhas reservas", 1));
+        w.extend(words_of("Ah, eu já estou acabando com as minhas reservas.", 1));
+        let r = dedupe_repeats(w);
+        assert_eq!(join(&r), "Ah, eu já estou acabando com as minhas reservas.");
+    }
+
+    #[test]
+    fn dedupe_keeps_phrase_repeated_twice() {
+        let w = words_of("não sei bem", 2);
+        assert_eq!(dedupe_repeats(w.clone()), w);
+    }
+
+    #[test]
+    fn dedupe_keeps_short_triple() {
+        let w = words_of("não, não, não", 1);
+        assert_eq!(dedupe_repeats(w.clone()), w);
+        let w = words_of("sim", 3);
+        assert_eq!(dedupe_repeats(w.clone()), w);
+        assert_eq!(dedupe_repeats(words_of("sim", 4)).len(), 1);
+    }
+
+    #[test]
+    fn dedupe_is_fast_on_large_input() {
+        let w: Vec<Word> = (0..20_000u64).map(|i| word(i, i + 1, &format!("w{i}"))).collect();
+        let t = std::time::Instant::now();
+        let r = dedupe_repeats(w);
+        assert_eq!(r.len(), 20_000);
+        assert!(t.elapsed().as_secs() < 2);
+    }
+
+    #[test]
+    fn align_joins_words_without_leading_spaces() {
+        let w = [word(0, 10, "Bom,"), word(10, 20, "vocês"), word(20, 30, "poderiam")];
+        let u = align(&w, &[seg(0, 1000, 1)]);
+        assert_eq!(u[0].text, "Bom, vocês poderiam");
     }
 
     #[test]
