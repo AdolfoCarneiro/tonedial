@@ -1,5 +1,6 @@
 pub mod asr;
 pub mod audio;
+pub mod call;
 pub mod config;
 pub mod diarize;
 pub mod inhibit;
