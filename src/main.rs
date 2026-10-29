@@ -4,8 +4,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use tonedial::autostart;
+use tonedial::call::pipewire;
 use tonedial::events::AppEvent;
 use tonedial::instance::{self, Instance};
+use tonedial::tray;
 use tonedial::ui::{App, Shell};
 
 const ICON_PNG: &[u8] = include_bytes!("../assets/icons/tonedial-256.png");
@@ -49,6 +51,13 @@ fn main() -> eframe::Result {
             let _ = tx.send(AppEvent::ShowWindow);
         });
     }
+
+    let tray = tray::spawn(app.borrow().events());
+    app.borrow_mut().set_tray(tray);
+    let tx = app.borrow().events();
+    pipewire::spawn_watcher(std::process::id(), move |in_use, name| {
+        let _ = tx.send(AppEvent::MicUsage { in_use, app: name });
+    });
 
     let mut show = !background;
     loop {

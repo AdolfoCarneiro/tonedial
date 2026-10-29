@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDateTime;
 
 use crate::audio::call::CallRecorder;
+use crate::call::detector::{Detector, DetectorAction, DetectorCtx};
 use crate::audio::decode;
 use crate::audio::record::{
     Failure, Levels, Monitor, Recorder, list_input_devices, pending_recordings, recordings_dir,
@@ -25,7 +26,9 @@ use crate::config::Config;
 use crate::events::AppEvent;
 use crate::inhibit::SleepGuard;
 use crate::models::{SetupProgress, ensure_models, missing_models, models_dir};
+use crate::notify::{DesktopNotifier, Notifier, SilentNotifier};
 use crate::pipeline::{self, Job, Outcome, Progress, Source, Stage};
+use crate::tray::{TrayHandle, TrayState};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SetupState {
@@ -172,6 +175,11 @@ pub struct App {
     setup_warning: Option<String>,
     /// `RecordCall` sem pasta de saída e sem janela: grava ao abrir a janela, que pergunta a pasta.
     call_after_show: bool,
+    detector: Detector,
+    /// Número da última pergunta de fim; respostas de perguntas anteriores são ignoradas.
+    end_generation: u64,
+    notifier: Box<dyn Notifier>,
+    tray: Option<TrayHandle>,
 }
 
 /// Título da tela de processamento de uma gravação.
@@ -303,6 +311,10 @@ impl App {
             inhibit_enabled: false,
             setup_warning: None,
             call_after_show: false,
+            detector: Detector::new(),
+            end_generation: 0,
+            notifier: Box::new(SilentNotifier),
+            tray: None,
         }
     }
 
@@ -394,6 +406,7 @@ impl App {
         let devices = list_input_devices();
         let mut app = App::with_events(Config::load(), devices, Screen::Idle, events);
         app.inhibit_enabled = true;
+        app.notifier = Box::new(DesktopNotifier { tx: app.events_tx.clone() });
         app.go_idle();
         app
     }
@@ -401,6 +414,21 @@ impl App {
     /// Para outras threads (instância única, bandeja, detector) falarem com o App.
     pub fn events(&self) -> Sender<AppEvent> {
         self.events_tx.clone()
+    }
+
+    pub fn set_tray(&mut self, tray: Option<TrayHandle>) {
+        self.tray = tray;
+    }
+
+    /// Ícone e tooltip da bandeja para a tela atual.
+    pub fn tray_state(&self) -> TrayState {
+        let (recording, tooltip) = match &self.screen {
+            Screen::Recording(r) if r.is_call() => (true, format!("Gravando call · {}", format_clock(r.elapsed()))),
+            Screen::Recording(r) => (true, format!("Gravando · {}", format_clock(r.elapsed()))),
+            Screen::Processing(_) => (false, "Transcrevendo…".to_string()),
+            _ => (false, "Tone Dial".to_string()),
+        };
+        TrayState { recording, tooltip }
     }
 
     /// Todo o trabalho que não desenha: roda com ou sem janela.
@@ -420,12 +448,16 @@ impl App {
 
         let events: Vec<_> = self.events_rx.try_iter().collect();
         for e in events {
-            self.on_event(e);
+            self.handle_event(e, Instant::now());
         }
         self.sync_sleep_guard();
+        if let Some(t) = &self.tray {
+            t.set(self.tray_state());
+        }
     }
 
-    fn on_event(&mut self, e: AppEvent) {
+    /// `now` vem de fora para os testes controlarem os tempos do detector.
+    fn handle_event(&mut self, e: AppEvent, now: Instant) {
         match e {
             AppEvent::ShowWindow => self.show_requested = true,
             AppEvent::Quit => {
@@ -438,9 +470,28 @@ impl App {
             }
             AppEvent::RecordCall => self.record_call(),
             AppEvent::StopRecording => self.stop_recording(None),
-            // ligados nas próximas tarefas (detector, bandeja)
-            AppEvent::MicUsage { .. }
-            | AppEvent::EndAnswer { .. } => {}
+            AppEvent::MicUsage { in_use, app } => self.on_mic_usage(now, in_use, app.as_deref()),
+            AppEvent::EndAnswer { generation, stop } => {
+                let call = matches!(&self.screen, Screen::Recording(r) if r.is_call());
+                if stop && call && generation == self.end_generation {
+                    self.stop_recording(None);
+                }
+            }
+        }
+    }
+
+    fn on_mic_usage(&mut self, now: Instant, in_use: bool, app: Option<&str>) {
+        let call_recording = matches!(&self.screen, Screen::Recording(r) if r.is_call());
+        let busy = matches!(self.screen, Screen::Recording(_) | Screen::Processing(_) | Screen::Setup(_));
+        match self.detector.observe(now, in_use, app, DetectorCtx { busy, call_recording }) {
+            Some(DetectorAction::AskStart { app }) => self.notifier.ask_start(app.as_deref()),
+            Some(DetectorAction::AskEnd) => {
+                self.end_generation += 1;
+                self.notifier.ask_end(self.end_generation);
+            }
+            // a call voltou: um "Parar" atrasado da pergunta anterior não vale mais
+            Some(DetectorAction::CallBack) => self.end_generation += 1,
+            None => {}
         }
     }
 
@@ -455,7 +506,17 @@ impl App {
             self.show_requested = true;
             return;
         }
+        let no_mic = self.selected_mic().is_none();
         self.start_recording(true);
+        // sem janela, o erro ficaria invisível
+        if !self.window_open && !matches!(self.screen, Screen::Recording(_)) {
+            let msg = match &self.screen {
+                _ if no_mic => "Nenhum microfone encontrado".to_string(),
+                Screen::Error(m) => m.clone(),
+                _ => "Não foi possível gravar".to_string(),
+            };
+            self.notifier.record_failed(&msg);
+        }
     }
 
     pub fn window_opened(&mut self) {
@@ -556,6 +617,17 @@ impl App {
         let Some(rx) = &self.proc_rx else { return };
         let msgs: Vec<_> = rx.try_iter().collect();
         for m in msgs {
+            // com a janela aberta ela mesma mostra o fim
+            if let (false, Screen::Processing(s)) = (self.window_open, &self.screen) {
+                match &m {
+                    Progress::Done(o) => {
+                        let notices: Vec<String> = s.note.iter().chain(&s.notice).cloned().collect();
+                        self.notifier.done(&o.md_path, &notices);
+                    }
+                    Progress::Failed(e) => self.notifier.failed(e),
+                    _ => {}
+                }
+            }
             self.on_progress(m);
         }
     }
@@ -666,8 +738,16 @@ impl App {
                 return;
             }
             // o mic falhou ao finalizar mas o arquivo existe; o do sistema é finalizado antes
-            Err(_) => call.as_ref().and_then(|(system, _)| system.clone()),
+            Err(_) => None,
         };
+        // o som do computador falhou ao finalizar: o WAV pode ter conteúdo (`source_after_call` confere)
+        let system = system.or_else(|| call.as_ref().and_then(|(system, _)| system.clone()));
+        // sem modelos (aceitou pela notificação): fica pendente e a janela abre no preparo
+        if !missing_models(&self.models_dir).is_empty() {
+            self.go_idle();
+            self.show_requested = true;
+            return;
+        }
         let (source, call_note) = match call {
             None => (Source::Recording { wav, started_at }, None),
             Some((_, note)) => source_after_call(wav, system, started_at, note),
@@ -1175,6 +1255,185 @@ mod tests {
         app.events().send(AppEvent::StopRecording).unwrap();
         app.tick();
         assert!(matches!(app.screen, Screen::Idle));
+    }
+
+    /// Registra as notificações em vez de falar com o D-Bus.
+    #[derive(Clone, Default)]
+    struct FakeNotifier(Rc<RefCell<Vec<String>>>);
+
+    impl Notifier for FakeNotifier {
+        fn ask_start(&self, app: Option<&str>) {
+            self.0.borrow_mut().push(format!("ask_start {app:?}"));
+        }
+        fn ask_end(&self, generation: u64) {
+            self.0.borrow_mut().push(format!("ask_end {generation}"));
+        }
+        fn done(&self, md: &std::path::Path, notices: &[String]) {
+            self.0.borrow_mut().push(format!("done {} {notices:?}", md.display()));
+        }
+        fn failed(&self, msg: &str) {
+            self.0.borrow_mut().push(format!("failed {msg}"));
+        }
+        fn record_failed(&self, msg: &str) {
+            self.0.borrow_mut().push(format!("record_failed {msg}"));
+        }
+    }
+
+    fn fake_notifier(app: &mut App) -> Rc<RefCell<Vec<String>>> {
+        let f = FakeNotifier::default();
+        let log = f.0.clone();
+        app.notifier = Box::new(f);
+        log
+    }
+
+    /// App gravando uma call (mic falso, sem som do computador), com modelos e pasta de saída
+    /// de mentira em `d`, para o parar não baixar nada.
+    fn recording_call_app(d: &std::path::Path) -> App {
+        let models = d.join("modelos");
+        std::fs::create_dir_all(&models).unwrap();
+        for m in missing_models(&models) {
+            std::fs::write(models.join(m.name), b"x").unwrap();
+        }
+        let out = d.join("saida");
+        std::fs::create_dir_all(&out).unwrap();
+        let (mic, _) = crate::audio::record::temp_call_paths(d, at(14, 30));
+        let rec = CallRecorder { mic: Recorder::fake(mic), system: None, system_note: None };
+        let mut app = App::with_state(Config::default(), vec![], Screen::Recording(Rec::Call(rec)));
+        app.models_dir = models;
+        app.config.output_dir = Some(out);
+        app
+    }
+
+    #[test]
+    fn resposta_de_fim_antiga_e_ignorada() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = recording_call_app(d.path());
+        app.end_generation = 2;
+        let now = Instant::now();
+        app.handle_event(AppEvent::EndAnswer { generation: 1, stop: true }, now);
+        assert!(matches!(app.screen, Screen::Recording(_)), "resposta velha não para");
+        app.handle_event(AppEvent::EndAnswer { generation: 2, stop: false }, now);
+        assert!(matches!(app.screen, Screen::Recording(_)), "continuar gravando");
+        app.handle_event(AppEvent::EndAnswer { generation: 2, stop: true }, now);
+        assert!(matches!(app.screen, Screen::Processing(_)));
+    }
+
+    #[test]
+    fn fim_de_call_pergunta_e_call_que_volta_invalida_a_pergunta() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = recording_call_app(d.path());
+        let log = fake_notifier(&mut app);
+        let t0 = Instant::now();
+        let at_s = |s: u64| t0 + Duration::from_secs(s);
+        for s in 0..10 {
+            app.handle_event(AppEvent::MicUsage { in_use: true, app: Some("Opera".into()) }, at_s(s));
+        }
+        for s in 10..=15 {
+            app.handle_event(AppEvent::MicUsage { in_use: false, app: None }, at_s(s));
+        }
+        assert_eq!(*log.borrow(), vec!["ask_end 1".to_string()]);
+        assert_eq!(app.end_generation, 1);
+        app.handle_event(AppEvent::MicUsage { in_use: true, app: Some("Opera".into()) }, at_s(20));
+        assert_eq!(app.end_generation, 2, "call voltou: a pergunta 1 não vale mais");
+        app.handle_event(AppEvent::EndAnswer { generation: 1, stop: true }, at_s(21));
+        assert!(matches!(app.screen, Screen::Recording(_)));
+    }
+
+    #[test]
+    fn tick_sem_janela_processa_progresso_e_avisa() {
+        let mut app = App::with_state(
+            Config::default(),
+            vec![],
+            Screen::Processing(ProcessingState::new("a".into(), Some("O microfone desconectou".into()))),
+        );
+        let log = fake_notifier(&mut app);
+        let (tx, rx) = mpsc::channel();
+        app.proc_rx = Some(rx);
+        tx.send(Progress::Notice("usando CPU".into())).unwrap();
+        tx.send(Progress::Done(Outcome { md_path: "/x/a.md".into(), speakers: 1, duration_ms: 1 }))
+            .unwrap();
+        app.tick();
+        assert!(matches!(app.screen, Screen::Done(_)));
+        assert_eq!(
+            *log.borrow(),
+            vec![r#"done /x/a.md ["O microfone desconectou", "usando CPU"]"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn tick_sem_janela_falha_vira_notificacao() {
+        let mut app = processing_app();
+        let log = fake_notifier(&mut app);
+        let (tx, rx) = mpsc::channel();
+        app.proc_rx = Some(rx);
+        tx.send(Progress::Failed("deu ruim".into())).unwrap();
+        app.tick();
+        assert!(matches!(app.screen, Screen::Error(_)));
+        assert_eq!(*log.borrow(), vec!["failed deu ruim".to_string()]);
+    }
+
+    #[test]
+    fn com_janela_aberta_nao_notifica_o_fim() {
+        let mut app = processing_app();
+        let log = fake_notifier(&mut app);
+        app.window_opened();
+        let (tx, rx) = mpsc::channel();
+        app.proc_rx = Some(rx);
+        tx.send(Progress::Done(Outcome { md_path: "/x/a.md".into(), speakers: 1, duration_ms: 1 }))
+            .unwrap();
+        app.tick();
+        assert!(matches!(app.screen, Screen::Done(_)));
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn ask_start_vira_notificacao() {
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        let log = fake_notifier(&mut app);
+        let t0 = Instant::now();
+        for s in 0..=3 {
+            let ev = AppEvent::MicUsage { in_use: true, app: Some("Opera".into()) };
+            app.handle_event(ev, t0 + Duration::from_secs(s));
+        }
+        assert_eq!(*log.borrow(), vec![r#"ask_start Some("Opera")"#.to_string()]);
+
+        // processando: não pergunta
+        let mut busy = processing_app();
+        let log = fake_notifier(&mut busy);
+        for s in 0..=10 {
+            let ev = AppEvent::MicUsage { in_use: true, app: None };
+            busy.handle_event(ev, t0 + Duration::from_secs(s));
+        }
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn record_call_sem_janela_que_falha_avisa() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.config.output_dir = Some(d.path().to_path_buf());
+        app.recordings_dir = d.path().join("gravacoes");
+        let log = fake_notifier(&mut app);
+        app.events().send(AppEvent::RecordCall).unwrap();
+        app.tick();
+        assert!(!matches!(app.screen, Screen::Recording(_)));
+        let log = log.borrow();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].starts_with("record_failed "), "{log:?}");
+    }
+
+    #[test]
+    fn estado_da_bandeja_conforme_a_tela() {
+        let idle = App::with_state(Config::default(), vec![], Screen::Idle);
+        assert_eq!(idle.tray_state(), TrayState { recording: false, tooltip: "Tone Dial".into() });
+        assert_eq!(
+            processing_app().tray_state(),
+            TrayState { recording: false, tooltip: "Transcrevendo…".into() }
+        );
+        let d = tempfile::tempdir().unwrap();
+        let rec = recording_call_app(d.path()).tray_state();
+        assert!(rec.recording);
+        assert!(rec.tooltip.starts_with("Gravando call · 00:00:"), "{}", rec.tooltip);
     }
 
     #[test]

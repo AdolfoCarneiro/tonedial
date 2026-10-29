@@ -9,6 +9,8 @@ pub mod inhibit;
 pub mod instance;
 pub mod models;
 pub mod naming;
+pub mod notify;
 pub mod pipeline;
 pub mod transcript;
+pub mod tray;
 pub mod ui;

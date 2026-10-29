@@ -495,6 +495,25 @@ impl Recorder {
         })
     }
 
+    /// Gravador sem microfone (testes): o WAV fica vazio, e o `stop` funciona como o de verdade.
+    #[cfg(test)]
+    pub(crate) fn fake(wav_path: PathBuf) -> Recorder {
+        let sink = WavSink::create(&wav_path, 48_000).expect("WAV do gravador falso");
+        let failure: Arc<Mutex<Option<Failure>>> = Arc::default();
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let fail_w = failure.clone();
+        Recorder {
+            levels: Levels::default(),
+            wav_path,
+            started_at: Local::now().naive_local(),
+            started: Instant::now(),
+            failure,
+            tx,
+            writer: Some(std::thread::spawn(move || writer_loop(rx, sink, fail_w))),
+            capture: None,
+        }
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }

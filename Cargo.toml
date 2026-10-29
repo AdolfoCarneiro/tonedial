@@ -21,6 +21,8 @@ eframe = "0.37.0"
 rfd = "0.17.2"
 open = "5.4.5"
 egui = "0.37"
+ksni = { version = "0.3.7", features = ["blocking"] }
+notify-rust = "4.18.2"
 
 [features]
 sherpa = ["dep:sherpa-onnx"]

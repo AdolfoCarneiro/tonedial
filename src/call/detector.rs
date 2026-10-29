@@ -61,6 +61,10 @@ impl Detector {
         if free_for.is_some_and(|d| d >= SOLTO_ATE_FIM) {
             self.asked_start = false;
         }
+        // uso visto com o app ocupado: ao terminar, não pergunta pela mesma sessão
+        if in_use && ctx.busy {
+            self.asked_start = true;
+        }
 
         if ctx.call_recording {
             if in_use {
@@ -178,6 +182,27 @@ mod tests {
             let ctx = DetectorCtx { busy: true, call_recording: false };
             assert_eq!(d.observe(c.t(s), true, None, ctx), None);
         }
+    }
+
+    #[test]
+    fn uso_visto_ocupado_conta_como_ja_perguntado() {
+        let (c, mut d) = (clock(), Detector::new());
+        let busy = || DetectorCtx { busy: true, call_recording: false };
+        for s in 0..=10 {
+            assert_eq!(d.observe(c.t(s), true, Some("Opera"), busy()), None);
+        }
+        // terminou de processar com a mesma sessão de uso: não pergunta
+        for s in 11..=60 {
+            assert_eq!(d.observe(c.t(s), true, Some("Opera"), idle()), None);
+        }
+        // soltou de verdade e pegou de novo: sessão nova
+        for s in 61..=66 {
+            d.observe(c.t(s), false, None, idle());
+        }
+        for s in 67..=69 {
+            assert_eq!(d.observe(c.t(s), true, None, idle()), None);
+        }
+        assert_eq!(d.observe(c.t(70), true, None, idle()), Some(DetectorAction::AskStart { app: None }));
     }
 
     #[test]

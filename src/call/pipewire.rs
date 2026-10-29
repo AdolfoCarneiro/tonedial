@@ -119,13 +119,29 @@ fn read_dump() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Registra o resultado do ciclo; `true` se a falha é nova (primeira, ou depois de um sucesso).
+fn log_failure(failing: &mut bool, failed: bool) -> bool {
+    let new = failed && !*failing;
+    *failing = failed;
+    new
+}
+
 /// Lê o grafo a cada 2 s e avisa se alguém usa o mic. Falha do pw-dump só pula o ciclo.
 pub fn spawn_watcher(own_pid: u32, on_sample: impl Fn(bool, Option<String>) + Send + 'static) {
     std::thread::spawn(move || {
+        let mut failing = false;
         loop {
             match read_dump().and_then(|j| mic_users(&j, own_pid)) {
-                Ok(users) => on_sample(!users.is_empty(), users.into_iter().next().and_then(|u| u.app)),
-                Err(e) => eprintln!("detector de call: {e:#}"),
+                Ok(users) => {
+                    log_failure(&mut failing, false);
+                    on_sample(!users.is_empty(), users.into_iter().next().and_then(|u| u.app));
+                }
+                // a cada 2 s o mesmo erro encheria o log: só quando muda
+                Err(e) => {
+                    if log_failure(&mut failing, true) {
+                        eprintln!("detector de call: {e:#}");
+                    }
+                }
             }
             std::thread::sleep(Duration::from_secs(2));
         }
@@ -166,6 +182,16 @@ mod tests {
         assert_eq!(as_pid(Some(&serde_json::json!(7))), Some(7));
         assert_eq!(as_pid(Some(&serde_json::json!("7"))), Some(7));
         assert_eq!(as_pid(None), None);
+    }
+
+    #[test]
+    fn falha_do_pw_dump_so_loga_na_mudanca() {
+        let mut failing = false;
+        assert!(log_failure(&mut failing, true), "primeira falha");
+        assert!(!log_failure(&mut failing, true));
+        assert!(!log_failure(&mut failing, true));
+        assert!(!log_failure(&mut failing, false));
+        assert!(log_failure(&mut failing, true), "falha depois de um sucesso");
     }
 
     #[test]
