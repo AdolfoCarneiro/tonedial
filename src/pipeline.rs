@@ -531,6 +531,45 @@ mod tests {
     }
 
     #[test]
+    fn call_ogg_dura_o_tanto_do_lado_mais_longo() {
+        let d = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (job, _, _) = call_job(d.path(), out.path(), 1, 3);
+        let (tx, rx) = mpsc::channel();
+        let transcriber: Transcriber = Box::new(|_, _| Ok(vec![]));
+        run_inner(job, transcriber, no_diarizer(), || Ok(()), tx);
+        let msgs: Vec<Progress> = rx.try_iter().collect();
+        let Some(Progress::Done(o)) = msgs.last() else { panic!("esperava Done: {msgs:?}") };
+        assert!((2_900..=3_200).contains(&o.duration_ms), "{}", o.duration_ms);
+        let ms = decode::probe(&out.path().join("2026-10-28-1430.ogg")).unwrap().duration_ms;
+        assert!((2_900..=3_200).contains(&ms), "{ms}");
+    }
+
+    #[test]
+    fn call_sem_palavras_no_sistema_pula_diarizacao_e_so_tem_eu() {
+        let d = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (job, _, _) = call_job(d.path(), out.path(), 2, 2);
+        let (tx, rx) = mpsc::channel();
+        let mut calls = 0;
+        let transcriber: Transcriber = Box::new(move |_, _| {
+            calls += 1;
+            Ok(if calls == 1 {
+                vec![Word { start_ms: 0, end_ms: 400, text: "oi".into() }]
+            } else {
+                vec![]
+            })
+        });
+        run_inner(job, transcriber, Box::new(|| panic!("não devia diarizar")), || Ok(()), tx);
+        let msgs: Vec<Progress> = rx.try_iter().collect();
+        assert!(!msgs.iter().any(|m| matches!(m, Progress::Stage(Stage::Diarizing) | Progress::Notice(_))), "{msgs:?}");
+        let Some(Progress::Done(o)) = msgs.last() else { panic!("esperava Done: {msgs:?}") };
+        assert_eq!(o.speakers, 1);
+        let md = std::fs::read_to_string(&o.md_path).unwrap();
+        assert!(md.contains("**Eu** [00:00:00]: oi") && !md.contains("Falante"), "{md}");
+    }
+
+    #[test]
     fn call_diariza_so_o_sistema() {
         let d = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();

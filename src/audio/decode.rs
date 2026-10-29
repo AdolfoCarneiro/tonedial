@@ -134,7 +134,11 @@ pub fn encode_ogg(wav: &Path, out: &Path) -> Result<()> {
 }
 
 /// Call: `.ogg` estéreo, esquerdo = mic, direito = sistema (Opus 96 kbps).
+/// O lado mais curto é completado com silêncio: o .ogg dura o tanto do mais longo
+/// (o `amerge` sozinho cortaria no mais curto, e os WAVs são apagados depois).
 pub fn encode_ogg_stereo(left: &Path, right: &Path, out: &Path) -> Result<()> {
+    let secs = probe(left)?.duration_ms.max(probe(right)?.duration_ms) as f64 / 1000.0;
+    let secs = format!("{secs:.3}");
     encode_part_then_rename(
         &ffmpeg_bin(),
         &[
@@ -143,11 +147,13 @@ pub fn encode_ogg_stereo(left: &Path, right: &Path, out: &Path) -> Result<()> {
             "-i".as_ref(),
             right.as_os_str(),
             "-filter_complex".as_ref(),
-            "[0:a][1:a]amerge=inputs=2[a]".as_ref(),
+            "[0:a]apad[a0];[1:a]apad[a1];[a0][a1]amerge=inputs=2[a]".as_ref(),
             "-map".as_ref(),
             "[a]".as_ref(),
             "-ac".as_ref(),
             "2".as_ref(),
+            "-t".as_ref(),
+            secs.as_ref(),
             "-c:a".as_ref(),
             "libopus".as_ref(),
             "-b:a".as_ref(),
@@ -302,5 +308,28 @@ mod tests {
         std::fs::write(&p, "isto nao e audio").unwrap();
         let e = decode_16k_mono(&p).unwrap_err();
         assert!(e.to_string().starts_with("Não consegui ler o áudio"), "{e}");
+    }
+
+    #[test]
+    fn stereo_dura_o_tanto_do_lado_mais_longo() {
+        let d = tempfile::tempdir().unwrap();
+        let mk = |name: &str, secs: u32| {
+            let p = d.path().join(name);
+            let st = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(format!("sine=frequency=440:duration={secs}"))
+                .arg(&p)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            p
+        };
+        let (a, b) = (mk("a.wav", 1), mk("b.wav", 3));
+        for (l, r) in [(&a, &b), (&b, &a)] {
+            let out = d.path().join("s.ogg");
+            encode_ogg_stereo(l, r, &out).unwrap();
+            let ms = probe(&out).unwrap().duration_ms;
+            assert!((2_900..=3_200).contains(&ms), "{ms}");
+        }
     }
 }
