@@ -372,8 +372,8 @@ fn chunk_of(chunks: &[(i64, i64)], t_cs: i64) -> usize {
 
 /// Blocos em que a passada contínua falhou e que precisam ser redecodificados isolados:
 /// - laço: dois segmentos seguidos com o mesmo texto (o whisper repetindo a frase anterior);
-/// - fala perdida: trechos do VAD sem nenhuma palavra somando `REDO_UNCOVERED_CS` ou mais
-///   (o `seek` pulou por cima deles).
+/// - fala perdida: trechos do VAD sem nenhuma palavra somando `REDO_UNCOVERED_CS` ou mais, ou
+///   um buraco desse tamanho sem palavra dentro de um trecho (o `seek` pulou por cima da fala).
 fn chunks_to_redo(
     chunks: &[(i64, i64)],
     pieces: &[VadPiece],
@@ -388,21 +388,73 @@ fn chunks_to_redo(
         let (prev, cur) = (&pair[0], &pair[1]);
         let text = crate::transcript::normalize(cur.2);
         if !text.is_empty() && text == crate::transcript::normalize(prev.2) {
-            for flag in &mut redo[chunk_of(chunks, prev.0)..=chunk_of(chunks, cur.1)] {
+            let (a, b) = (chunk_of(chunks, prev.0), chunk_of(chunks, cur.1));
+            for flag in &mut redo[a.min(b)..=a.max(b)] {
                 *flag = true;
             }
         }
     }
+    let mut sorted = words_cs.to_vec();
+    sorted.sort_unstable();
     let mut uncovered = vec![0i64; chunks.len()];
     for p in pieces {
         let (a, b) = (p.proc_start_cs, p.proc_start_cs + p.len_cs);
-        if !words_cs.iter().any(|&(w0, w1)| w0 < b && w1 > a) {
-            uncovered[chunk_of(chunks, a)] += p.len_cs;
+        let i = chunk_of(chunks, a);
+        let inside: Vec<_> = sorted.iter().filter(|&&(w0, w1)| w0 < b && w1 > a).collect();
+        if inside.is_empty() {
+            uncovered[i] += p.len_cs;
+            continue;
+        }
+        // Buraco dentro do trecho: fala longa sem palavra entre duas palavras (ou nas pontas).
+        let mut cursor = a;
+        let mut max_gap = 0;
+        for &&(w0, w1) in &inside {
+            max_gap = max_gap.max(w0 - cursor);
+            cursor = cursor.max(w1);
+        }
+        max_gap = max_gap.max(b - cursor);
+        if max_gap >= REDO_UNCOVERED_CS {
+            redo[i] = true;
         }
     }
     (0..chunks.len())
         .filter(|&i| redo[i] || uncovered[i] >= REDO_UNCOVERED_CS)
         .collect()
+}
+
+/// Ponto médio de uma palavra, em centésimos (as palavras ainda estão em ms).
+fn mid_cs(w: &Word) -> i64 {
+    ((w.start_ms + w.end_ms) / 20) as i64
+}
+
+/// Troca, nos blocos refeitos, as palavras da passada contínua pelas da redecodificação.
+/// Cada palavra pertence ao bloco do seu ponto médio (o início pode escorregar para o vizinho:
+/// os blocos ficam a só 0,1 s um do outro). Uma palavra refeita fora do seu bloco é descartada
+/// (o whisper completa o bloco com silêncio até 30 s e pode inventar algo ali, e um trecho
+/// vizinho saudável já tem as suas), e as que ficam são limitadas às bordas do bloco.
+fn splice(
+    first: Vec<Word>,
+    chunks: &[(i64, i64)],
+    redo: &[usize],
+    redone: Vec<(usize, Vec<Word>)>,
+) -> Vec<Word> {
+    let mut words: Vec<Word> = first
+        .into_iter()
+        .filter(|w| !redo.contains(&chunk_of(chunks, mid_cs(w))))
+        .collect();
+    for (i, block) in redone {
+        let (start_ms, end_ms) = (chunks[i].0 as u64 * 10, chunks[i].1 as u64 * 10);
+        words.extend(block.into_iter().filter(|w| chunk_of(chunks, mid_cs(w)) == i).map(|w| {
+            let start = w.start_ms.clamp(start_ms, end_ms);
+            Word {
+                start_ms: start,
+                end_ms: w.end_ms.clamp(start, end_ms),
+                text: w.text,
+            }
+        }));
+    }
+    words.sort_by_key(|w| w.start_ms);
+    words
 }
 
 /// `samples` é o áudio já comprimido pelo VAD; `pieces` mapeia os tempos de volta ao original.
@@ -443,17 +495,16 @@ fn run_once(
     let redo = chunks_to_redo(&chunks, pieces, &seg_spans, &words_cs);
 
     if !redo.is_empty() {
-        words.retain(|w| !redo.contains(&chunk_of(&chunks, (w.start_ms / 10) as i64)));
+        let mut redone = Vec::new();
         for (k, &i) in redo.iter().enumerate() {
             let (start_cs, end_cs) = chunks[i];
             let a = (start_cs as usize * SAMPLES_PER_CS).min(samples.len());
             let b = (end_cs as usize * SAMPLES_PER_CS).min(samples.len());
-            for seg in decode(&mut state, full_params(), &samples[a..b], start_cs)? {
-                words.extend(seg.words);
-            }
+            let segs = decode(&mut state, full_params(), &samples[a..b], start_cs)?;
+            redone.push((i, segs.into_iter().flat_map(|s| s.words).collect()));
             progress(FIRST_PASS + (1.0 - FIRST_PASS) * (k + 1) as f32 / redo.len() as f32);
         }
-        words.sort_by_key(|w| w.start_ms);
+        words = splice(words, &chunks, &redo, redone);
     }
 
     let words = words
@@ -518,7 +569,6 @@ fn validate_inputs(model_path: &Path, vad_model: &Path) -> Result<()> {
 ///
 /// Atenção: o whisper-rs vaza o closure de progresso (nunca o dropa), então `on_progress`
 /// não pode depender de ser liberado, por exemplo para fechar um `Sender`.
-///
 pub fn transcribe(
     model: &mut LoadedModel,
     model_path: &Path,
@@ -865,7 +915,7 @@ mod tests {
             (6300, 6300, " eu estou acabando com as minhas reservas"),
         ];
         // Palavras só no 1o bloco e no começo do laço; nada no 3o; o 4o está saudável.
-        let words = [(0, 400), (500, 900), (1010, 1500), (3000, 3300), (9000, 9500)];
+        let words = [(0, 400), (500, 900), (1010, 1900), (3000, 3300), (9000, 9900)];
         assert_eq!(chunks_to_redo(&chunks, &pieces, &segs, &words), vec![1, 2]);
     }
 
@@ -877,6 +927,57 @@ mod tests {
         let segs = [(0, 500, " Sim."), (500, 1000, " Não."), (1000, 1000, "")];
         assert!(chunks_to_redo(&chunks, &pieces, &segs, &[(0, 900)]).is_empty());
         assert!(chunks_to_redo(&[], &[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn redo_flags_gap_inside_long_piece() {
+        // Um trecho só de 25 s com palavras no começo e no fim e 3 s sem nada no meio: nenhum
+        // trecho inteiro fica descoberto e não há laço; só o buraco interno dispara.
+        let pieces = [VadPiece { proc_start_cs: 0, orig_start_cs: 0, len_cs: 2500 }];
+        let chunks = plan_chunks(&pieces, 2800);
+        let segs = [(0, 1000, " Primeira parte."), (1300, 2500, " Segunda parte.")];
+        let mut words: Vec<(i64, i64)> = (0..10).map(|k| (k * 100, k * 100 + 90)).collect();
+        words.extend((13..25).map(|k| (k * 100, k * 100 + 90)));
+        assert_eq!(chunks_to_redo(&chunks, &pieces, &segs, &words), vec![0]);
+        // Sem o buraco (palavras a cada segundo), nada a refazer.
+        let full: Vec<(i64, i64)> = (0..25).map(|k| (k * 100, k * 100 + 90)).collect();
+        assert!(chunks_to_redo(&chunks, &pieces, &segs, &full).is_empty());
+    }
+
+    fn w(start_ms: u64, end_ms: u64, text: &str) -> Word {
+        Word { start_ms, end_ms, text: text.into() }
+    }
+
+    #[test]
+    fn splice_assigns_words_to_blocks_by_midpoint() {
+        // Blocos (cs): 0..1000 saudável, 1010..2000 refeito, 2010..3000 saudável.
+        let chunks = [(0, 1000), (1010, 2000), (2010, 3000)];
+        let first = vec![
+            w(1000, 9000, "antes"),
+            // Começo escorregou para dentro do bloco refeito, mas o meio está no saudável: fica.
+            w(9500, 10_150, "borda"),
+            w(12_000, 13_000, "laço"),
+            w(25_000, 26_000, "depois"),
+        ];
+        let redone = vec![(1, vec![
+            w(10_100, 12_000, "novo"),
+            // Escorregou para o bloco seguinte (saudável, já tem a sua): descarta, não duplica.
+            w(19_900, 20_400, "depois"),
+            // Além do fim do bloco (o whisper completa até 30 s): descarta.
+            w(28_000, 29_000, "fantasma"),
+        ])];
+        let out = splice(first, &chunks, &[1], redone);
+        let texts: Vec<&str> = out.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["antes", "borda", "novo", "depois"]);
+        assert!(out.windows(2).all(|p| p[0].start_ms <= p[1].start_ms));
+    }
+
+    #[test]
+    fn splice_clamps_redone_words_to_their_block() {
+        let chunks = [(0, 1000), (1010, 2000), (2010, 3000)];
+        let redone = vec![(1, vec![w(10_050, 10_500, "cedo"), w(19_500, 20_090, "tarde")])];
+        let out = splice(Vec::new(), &chunks, &[1], redone);
+        assert_eq!(out, vec![w(10_100, 10_500, "cedo"), w(19_500, 20_000, "tarde")]);
     }
 
     #[test]
