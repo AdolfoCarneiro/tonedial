@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
-    WhisperVadContextParams, WhisperVadParams,
+    WhisperState, WhisperVadContextParams, WhisperVadParams,
 };
 
 use crate::transcript::{Word, dedupe_repeats};
@@ -218,6 +218,27 @@ fn compress_samples(samples: &[f32], pieces: &[VadPiece]) -> Vec<f32> {
     out
 }
 
+/// Tamanho máximo (centésimos) de um bloco redecodificado isolado: cabe numa janela de 30 s
+/// do Whisper, com folga.
+const CHUNK_MAX_CS: i64 = 2800;
+
+/// Fala sem nenhuma palavra (centésimos) a partir da qual um bloco é considerado perdido.
+const REDO_UNCOVERED_CS: i64 = 200;
+
+/// Agrupa trechos consecutivos em blocos (início, fim no áudio comprimido, em centésimos) de no
+/// máximo `max_cs`; um trecho maior que isso vira um bloco sozinho (o whisper o fatia por dentro).
+fn plan_chunks(pieces: &[VadPiece], max_cs: i64) -> Vec<(i64, i64)> {
+    let mut chunks: Vec<(i64, i64)> = Vec::new();
+    for p in pieces {
+        let end = p.proc_start_cs + p.len_cs;
+        match chunks.last_mut() {
+            Some((start, e)) if end - *start <= max_cs => *e = end,
+            _ => chunks.push((p.proc_start_cs, end)),
+        }
+    }
+    chunks
+}
+
 /// Tempo (centésimos) do áudio comprimido -> áudio original. Dentro de um trecho é o deslocamento
 /// do trecho. No silêncio inserido entre trechos, um começo de palavra vai para o início do
 /// próximo trecho e um fim de palavra para o fim do trecho anterior.
@@ -276,19 +297,7 @@ impl std::fmt::Display for BackendFailure {
 
 impl std::error::Error for BackendFailure {}
 
-/// `samples` é o áudio já comprimido pelo VAD; `pieces` mapeia os tempos de volta ao original.
-fn run_once(
-    ctx: &WhisperContext,
-    samples: &[f32],
-    pieces: &[VadPiece],
-    progress: impl FnMut(i32) + 'static,
-) -> Result<Vec<Word>> {
-    let mut state = ctx.create_state().map_err(|e| {
-        anyhow::Error::new(BackendFailure(format!(
-            "falha ao criar o estado do whisper: {e}"
-        )))
-    })?;
-
+fn full_params() -> FullParams<'static, 'static> {
     let mut params = FullParams::new(SamplingStrategy::BeamSearch {
         beam_size: 5,
         patience: -1.0,
@@ -303,14 +312,30 @@ fn run_once(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
-    params.set_progress_callback_safe(progress);
+    params
+}
 
+/// Segmento do whisper com tempos no áudio comprimido: `t0_cs`/`t1_cs` em centésimos e as
+/// palavras em milissegundos (ainda não mapeadas para o áudio original).
+struct DecodedSeg {
+    t0_cs: i64,
+    t1_cs: i64,
+    text: String,
+    words: Vec<Word>,
+}
+
+/// Roda `full` em `samples` (que começa em `offset_cs` do áudio comprimido) e devolve os
+/// segmentos com os tempos já somados a `offset_cs`.
+fn decode(
+    state: &mut WhisperState,
+    params: FullParams,
+    samples: &[f32],
+    offset_cs: i64,
+) -> Result<Vec<DecodedSeg>> {
     state
         .full(params, samples)
         .map_err(|e| anyhow::Error::new(BackendFailure(format!("falha na transcrição: {e}"))))?;
-
-    // Uma palavra nunca atravessa segmentos: cada segmento é montado sozinho.
-    let mut words = Vec::new();
+    let mut segs = Vec::new();
     for seg in state.as_iter() {
         let mut tokens = Vec::new();
         for i in 0..seg.n_tokens() {
@@ -322,12 +347,127 @@ fn run_once(
                 .to_vec();
             tokens.push(Tok {
                 bytes,
-                t0: map_to_original(pieces, data.t0, false),
-                t1: map_to_original(pieces, data.t1, true),
+                t0: offset_cs + data.t0,
+                t1: offset_cs + data.t1,
             });
         }
-        words.extend(words_from_tokens(&tokens));
+        segs.push(DecodedSeg {
+            t0_cs: offset_cs + seg.start_timestamp(),
+            t1_cs: offset_cs + seg.end_timestamp(),
+            text: seg.to_str_lossy().map(|t| t.into_owned()).unwrap_or_default(),
+            // Uma palavra nunca atravessa segmentos: cada segmento é montado sozinho.
+            words: words_from_tokens(&tokens),
+        });
     }
+    Ok(segs)
+}
+
+/// Índice do bloco que contém o instante `t_cs` (o último que começa em ou antes dele).
+fn chunk_of(chunks: &[(i64, i64)], t_cs: i64) -> usize {
+    chunks
+        .iter()
+        .rposition(|&(start, _)| start <= t_cs)
+        .unwrap_or(0)
+}
+
+/// Blocos em que a passada contínua falhou e que precisam ser redecodificados isolados:
+/// - laço: dois segmentos seguidos com o mesmo texto (o whisper repetindo a frase anterior);
+/// - fala perdida: trechos do VAD sem nenhuma palavra somando `REDO_UNCOVERED_CS` ou mais
+///   (o `seek` pulou por cima deles).
+fn chunks_to_redo(
+    chunks: &[(i64, i64)],
+    pieces: &[VadPiece],
+    segs: &[(i64, i64, &str)],
+    words_cs: &[(i64, i64)],
+) -> Vec<usize> {
+    let mut redo = vec![false; chunks.len()];
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    for pair in segs.windows(2) {
+        let (prev, cur) = (&pair[0], &pair[1]);
+        let text = crate::transcript::normalize(cur.2);
+        if !text.is_empty() && text == crate::transcript::normalize(prev.2) {
+            for flag in &mut redo[chunk_of(chunks, prev.0)..=chunk_of(chunks, cur.1)] {
+                *flag = true;
+            }
+        }
+    }
+    let mut uncovered = vec![0i64; chunks.len()];
+    for p in pieces {
+        let (a, b) = (p.proc_start_cs, p.proc_start_cs + p.len_cs);
+        if !words_cs.iter().any(|&(w0, w1)| w0 < b && w1 > a) {
+            uncovered[chunk_of(chunks, a)] += p.len_cs;
+        }
+    }
+    (0..chunks.len())
+        .filter(|&i| redo[i] || uncovered[i] >= REDO_UNCOVERED_CS)
+        .collect()
+}
+
+/// `samples` é o áudio já comprimido pelo VAD; `pieces` mapeia os tempos de volta ao original.
+///
+/// Primeiro uma passada contínua sobre o áudio todo (o contexto entre janelas ajuda a precisão).
+/// Só que nela uma alucinação do decodificador (repetir uma frase, ou um segmento cujo tempo
+/// cobre a janela toda) faz o whisper.cpp avançar o `seek` por cima da fala real, e a frase
+/// repetida vira o prompt da janela seguinte (`no_context` só limpa o contexto no início do
+/// `full`), então o laço pode seguir até o fim do áudio. Isso acontece na CPU e na GPU; a
+/// numérica diferente do Vulkan só muda onde. Por isso os blocos em que a passada falhou
+/// (`chunks_to_redo`) são redecodificados isolados, sem contexto, e substituem o trecho ruim.
+fn run_once(
+    ctx: &WhisperContext,
+    samples: &[f32],
+    pieces: &[VadPiece],
+    progress: impl Fn(f32) + Clone + 'static,
+) -> Result<Vec<Word>> {
+    const FIRST_PASS: f32 = 0.95;
+    let mut state = ctx.create_state().map_err(|e| {
+        anyhow::Error::new(BackendFailure(format!(
+            "falha ao criar o estado do whisper: {e}"
+        )))
+    })?;
+
+    let mut params = full_params();
+    let first = progress.clone();
+    params.set_progress_callback_safe(move |p: i32| first(p as f32 / 100.0 * FIRST_PASS));
+    let segs = decode(&mut state, params, samples, 0)?;
+
+    let chunks = plan_chunks(pieces, CHUNK_MAX_CS);
+    let seg_spans: Vec<(i64, i64, &str)> =
+        segs.iter().map(|s| (s.t0_cs, s.t1_cs, s.text.as_str())).collect();
+    let mut words: Vec<Word> = segs.iter().flat_map(|s| s.words.iter().cloned()).collect();
+    let words_cs: Vec<(i64, i64)> = words
+        .iter()
+        .map(|w| ((w.start_ms / 10) as i64, (w.end_ms / 10) as i64))
+        .collect();
+    let redo = chunks_to_redo(&chunks, pieces, &seg_spans, &words_cs);
+
+    if !redo.is_empty() {
+        words.retain(|w| !redo.contains(&chunk_of(&chunks, (w.start_ms / 10) as i64)));
+        for (k, &i) in redo.iter().enumerate() {
+            let (start_cs, end_cs) = chunks[i];
+            let a = (start_cs as usize * SAMPLES_PER_CS).min(samples.len());
+            let b = (end_cs as usize * SAMPLES_PER_CS).min(samples.len());
+            for seg in decode(&mut state, full_params(), &samples[a..b], start_cs)? {
+                words.extend(seg.words);
+            }
+            progress(FIRST_PASS + (1.0 - FIRST_PASS) * (k + 1) as f32 / redo.len() as f32);
+        }
+        words.sort_by_key(|w| w.start_ms);
+    }
+
+    let words = words
+        .into_iter()
+        .map(|w| {
+            let start = map_to_original(pieces, (w.start_ms / 10) as i64, false).max(0) as u64;
+            let end = map_to_original(pieces, (w.end_ms / 10) as i64, true).max(0) as u64;
+            Word {
+                start_ms: start * 10,
+                end_ms: (end * 10).max(start * 10),
+                text: w.text,
+            }
+        })
+        .collect();
     Ok(dedupe_repeats(words))
 }
 
@@ -378,6 +518,7 @@ fn validate_inputs(model_path: &Path, vad_model: &Path) -> Result<()> {
 ///
 /// Atenção: o whisper-rs vaza o closure de progresso (nunca o dropa), então `on_progress`
 /// não pode depender de ser liberado, por exemplo para fechar um `Sender`.
+///
 pub fn transcribe(
     model: &mut LoadedModel,
     model_path: &Path,
@@ -413,7 +554,7 @@ fn transcribe_with(
             let cb = Arc::clone(&cb);
             run_once(ctx, &compressed, &pieces, move |p| {
                 if let Ok(mut f) = cb.lock() {
-                    f((p as f32 / 100.0).clamp(0.0, 1.0));
+                    f(p.clamp(0.0, 1.0));
                 }
             })
         },
@@ -681,6 +822,61 @@ mod tests {
         assert_eq!(map_to_original(&pieces, 215, true), 210);
         // Depois do fim: último ponto.
         assert_eq!(map_to_original(&pieces, 9999, true), 1200);
+    }
+
+    #[test]
+    fn chunks_group_pieces_up_to_the_limit() {
+        let p = |proc_start_cs, len_cs| VadPiece { proc_start_cs, orig_start_cs: 0, len_cs };
+        // 0..1000, 1010..2010, 2020..2520, 2530..6530 (maior que o limite), 6540..6640
+        let pieces = [p(0, 1000), p(1010, 1000), p(2020, 500), p(2530, 4000), p(6540, 100)];
+        assert_eq!(
+            plan_chunks(&pieces, 2800),
+            vec![(0, 2520), (2530, 6530), (6540, 6640)]
+        );
+        assert_eq!(plan_chunks(&pieces[..3], 2000), vec![(0, 1000), (1010, 2520)]);
+        assert!(plan_chunks(&[], 2800).is_empty());
+    }
+
+    #[test]
+    fn chunk_of_finds_containing_chunk() {
+        let chunks = [(0, 2520), (2530, 6530), (6540, 6640)];
+        assert_eq!(chunk_of(&chunks, 0), 0);
+        assert_eq!(chunk_of(&chunks, 2525), 0); // silêncio entre blocos fica com o anterior
+        assert_eq!(chunk_of(&chunks, 2530), 1);
+        assert_eq!(chunk_of(&chunks, 99_999), 2);
+    }
+
+    /// Regressão do caso da GPU (NURC, Vulkan): a passada contínua entra em laço numa frase
+    /// ("Eu estou acabando com as minhas reservas." 30+ vezes, um segmento cobrindo 30 s) e
+    /// não sai mais; nenhuma palavra cai nos trechos de fala seguintes. Os blocos do laço e os
+    /// que ficaram sem palavras têm de ser refeitos; os saudáveis, não.
+    #[test]
+    fn redo_flags_loops_and_skipped_speech_only() {
+        let p = |proc_start_cs, len_cs| VadPiece { proc_start_cs, orig_start_cs: proc_start_cs, len_cs };
+        let pieces = [p(0, 1000), p(1010, 1000), p(3000, 2000), p(5010, 500), p(6000, 2000), p(9000, 1000)];
+        let chunks = plan_chunks(&pieces, 2800);
+        assert_eq!(chunks, vec![(0, 2010), (3000, 5510), (6000, 8000), (9000, 10000)]);
+        let loop_txt = " Eu estou acabando com as minhas reservas.";
+        let segs = [
+            (0, 900, " Bom dia."),
+            (1010, 2000, " Tudo bem?"),
+            (3000, 3300, loop_txt),
+            (3300, 6300, loop_txt),
+            (6300, 6300, " eu estou acabando com as minhas reservas"),
+        ];
+        // Palavras só no 1o bloco e no começo do laço; nada no 3o; o 4o está saudável.
+        let words = [(0, 400), (500, 900), (1010, 1500), (3000, 3300), (9000, 9500)];
+        assert_eq!(chunks_to_redo(&chunks, &pieces, &segs, &words), vec![1, 2]);
+    }
+
+    #[test]
+    fn redo_ignores_small_gaps_and_distinct_text() {
+        let p = |proc_start_cs, len_cs| VadPiece { proc_start_cs, orig_start_cs: 0, len_cs };
+        let pieces = [p(0, 1000), p(1010, 150)]; // 1,5 s sem palavra: abaixo do limite
+        let chunks = plan_chunks(&pieces, 2800);
+        let segs = [(0, 500, " Sim."), (500, 1000, " Não."), (1000, 1000, "")];
+        assert!(chunks_to_redo(&chunks, &pieces, &segs, &[(0, 900)]).is_empty());
+        assert!(chunks_to_redo(&[], &[], &[], &[]).is_empty());
     }
 
     #[test]

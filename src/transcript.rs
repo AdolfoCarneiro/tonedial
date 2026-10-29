@@ -28,7 +28,7 @@ pub struct Header {
     pub source_name: String,
 }
 
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_ascii_punctuation() && !c.is_whitespace())
         .flat_map(|c| c.to_lowercase())
