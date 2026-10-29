@@ -46,7 +46,7 @@ Notebook com Fedora KDE e uma **RTX 2050 (4 GB de VRAM)**, com CUDA.
 
 ## Estado
 
-v1 implementada na branch `feat/v1` (2026-10-28): janela, gravação, transcrição e separação de falantes. Modelos conforme `docs/superpowers/specs/2026-10-28-comparacao-modelos.md`. Gravar call (mic + som do sistema, bandeja, detecção) implementada na branch `feat/calls` (2026-10-28); spec em `docs/superpowers/specs/2026-10-28-gravar-calls-design.md`. Instalação e uso no `README.md`.
+Na `main`: v1 (janela, gravação, transcrição e separação de falantes), com modelos conforme `docs/superpowers/specs/2026-10-28-comparacao-modelos.md`, e gravar call (mic + som do sistema, bandeja, detecção), com spec em `docs/superpowers/specs/2026-10-28-gravar-calls-design.md`. Instalação e uso no `README.md`; depois de mudar o código, `cargo install --path .` e reabrir o app pela bandeja.
 
 ## Convenções
 
