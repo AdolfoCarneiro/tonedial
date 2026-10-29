@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use notify_rust::{Hint, Notification};
 
@@ -44,16 +45,49 @@ pub fn ask_start(app: Option<&str>, tx: Sender<AppEvent>) {
     });
 }
 
-pub fn ask_end(generation: u64, tx: Sender<AppEvent>) {
+/// Id da última pergunta de fim mostrada, para `close_end` poder fechá-la.
+pub type EndId = Arc<Mutex<Option<u32>>>;
+
+pub fn ask_end(generation: u64, tx: Sender<AppEvent>, end_id: EndId) {
     let mut n = base("Tone Dial", "A call acabou? Parar e processar?");
     n.action("parar", "Parar").action("continuar", "Continuar gravando");
-    show(n, move |a| {
-        let stop = match a {
-            "parar" => true,
-            "continuar" => false,
-            _ => return,
-        };
-        let _ = tx.send(AppEvent::EndAnswer { generation, stop });
+    std::thread::spawn(move || match n.show() {
+        Ok(h) => {
+            let id = h.id();
+            *end_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+            h.wait_for_action(|a| {
+                let stop = match a {
+                    "parar" => true,
+                    "continuar" => false,
+                    _ => return,
+                };
+                let _ = tx.send(AppEvent::EndAnswer { generation, stop });
+            });
+            let mut cur = end_id.lock().unwrap_or_else(|e| e.into_inner());
+            if *cur == Some(id) {
+                *cur = None;
+            }
+        }
+        Err(e) => eprintln!("notificação: {e}"),
+    });
+}
+
+/// Fecha a pergunta de fim que ainda estiver na tela (a call voltou ou a gravação parou).
+pub fn close_end(end_id: &EndId) {
+    let Some(id) = end_id.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    std::thread::spawn(move || {
+        let r = zbus::blocking::Connection::session().and_then(|c| {
+            c.call_method(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                Some("org.freedesktop.Notifications"),
+                "CloseNotification",
+                &(id,),
+            )
+        });
+        if let Err(e) = r {
+            eprintln!("não consegui fechar a notificação: {e}");
+        }
     });
 }
 
@@ -97,6 +131,8 @@ pub fn record_failed(msg: &str, tx: Sender<AppEvent>) {
 pub trait Notifier {
     fn ask_start(&self, app: Option<&str>);
     fn ask_end(&self, generation: u64);
+    /// Fecha a pergunta de fim pendente, se houver.
+    fn close_end(&self);
     fn done(&self, md: &Path, notices: &[String]);
     fn failed(&self, msg: &str);
     /// Gravação pedida pela bandeja ou notificação não começou.
@@ -104,7 +140,14 @@ pub trait Notifier {
 }
 
 pub struct DesktopNotifier {
-    pub tx: Sender<AppEvent>,
+    tx: Sender<AppEvent>,
+    end_id: EndId,
+}
+
+impl DesktopNotifier {
+    pub fn new(tx: Sender<AppEvent>) -> Self {
+        DesktopNotifier { tx, end_id: EndId::default() }
+    }
 }
 
 impl Notifier for DesktopNotifier {
@@ -112,7 +155,12 @@ impl Notifier for DesktopNotifier {
         ask_start(app, self.tx.clone());
     }
     fn ask_end(&self, generation: u64) {
-        ask_end(generation, self.tx.clone());
+        // uma pergunta por vez: a anterior (se ainda aberta) sai da tela
+        close_end(&self.end_id);
+        ask_end(generation, self.tx.clone(), self.end_id.clone());
+    }
+    fn close_end(&self) {
+        close_end(&self.end_id);
     }
     fn done(&self, md: &Path, notices: &[String]) {
         done(md, notices);
@@ -131,6 +179,7 @@ pub struct SilentNotifier;
 impl Notifier for SilentNotifier {
     fn ask_start(&self, _: Option<&str>) {}
     fn ask_end(&self, _: u64) {}
+    fn close_end(&self) {}
     fn done(&self, _: &Path, _: &[String]) {}
     fn failed(&self, _: &str) {}
     fn record_failed(&self, _: &str) {}
@@ -139,6 +188,22 @@ impl Notifier for SilentNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mostra a pergunta de fim de verdade e fecha pelo D-Bus. `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "mostra uma notificação de verdade"]
+    fn pergunta_de_fim_fecha_pelo_dbus() {
+        let end_id = EndId::default();
+        ask_end(1, std::sync::mpsc::channel().0, end_id.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while end_id.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "notificação não apareceu");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        close_end(&end_id);
+        assert!(end_id.lock().unwrap().is_none());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn texto_da_pergunta_de_inicio() {

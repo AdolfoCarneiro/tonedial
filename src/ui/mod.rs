@@ -406,7 +406,7 @@ impl App {
         let devices = list_input_devices();
         let mut app = App::with_events(Config::load(), devices, Screen::Idle, events);
         app.inhibit_enabled = true;
-        app.notifier = Box::new(DesktopNotifier { tx: app.events_tx.clone() });
+        app.notifier = Box::new(DesktopNotifier::new(app.events_tx.clone()));
         app.go_idle();
         app
     }
@@ -428,7 +428,8 @@ impl App {
             Screen::Processing(_) => (false, "Transcrevendo…".to_string()),
             _ => (false, "Tone Dial".to_string()),
         };
-        TrayState { recording, tooltip }
+        let can_record = !matches!(self.screen, Screen::Processing(_) | Screen::Setup(_));
+        TrayState { recording, can_record, tooltip }
     }
 
     /// Todo o trabalho que não desenha: roda com ou sem janela.
@@ -490,9 +491,15 @@ impl App {
                 self.notifier.ask_end(self.end_generation);
             }
             // a call voltou: um "Parar" atrasado da pergunta anterior não vale mais
-            Some(DetectorAction::CallBack) => self.end_generation += 1,
+            Some(DetectorAction::CallBack) => self.end_call_question(),
             None => {}
         }
+    }
+
+    /// Invalida e fecha a pergunta de fim pendente.
+    fn end_call_question(&mut self) {
+        self.end_generation += 1;
+        self.notifier.close_end();
     }
 
     /// Bandeja ou notificação pediram para gravar a call. Ocupado, ignora. Sem pasta de
@@ -710,7 +717,12 @@ impl App {
             Recorder::start(&mic, temp_wav_path(&self.recordings_dir, now)).map(Rec::Mic)
         };
         match rec {
-            Ok(r) => self.screen = Screen::Recording(r),
+            Ok(r) => {
+                if r.is_call() {
+                    self.end_generation += 1;
+                }
+                self.screen = Screen::Recording(r);
+            }
             Err(e) => self.screen = Screen::Error(format!("Não foi possível gravar: {e:#}")),
         }
     }
@@ -720,6 +732,9 @@ impl App {
         let Screen::Recording(rec) = std::mem::replace(&mut self.screen, Screen::Idle) else {
             return;
         };
+        if rec.is_call() {
+            self.end_call_question();
+        }
         let wav = rec.mic().wav_path.clone();
         let started_at = rec.started_at();
         // (WAV do sistema, aviso) de uma call, lidos antes de parar
@@ -789,7 +804,10 @@ impl App {
         // os WAVs ficam em `gravacoes/` e voltam como pendentes (um par, se for call)
         match std::mem::replace(&mut self.screen, Screen::Idle) {
             Screen::Recording(Rec::Mic(r)) => drop(r.stop()),
-            Screen::Recording(Rec::Call(c)) => drop(c.stop()),
+            Screen::Recording(Rec::Call(c)) => {
+                self.notifier.close_end();
+                drop(c.stop());
+            }
             _ => {}
         }
         self.sleep_guard = None;
@@ -1268,6 +1286,9 @@ mod tests {
         fn ask_end(&self, generation: u64) {
             self.0.borrow_mut().push(format!("ask_end {generation}"));
         }
+        fn close_end(&self) {
+            self.0.borrow_mut().push("close_end".into());
+        }
         fn done(&self, md: &std::path::Path, notices: &[String]) {
             self.0.borrow_mut().push(format!("done {} {notices:?}", md.display()));
         }
@@ -1335,7 +1356,26 @@ mod tests {
         assert_eq!(app.end_generation, 1);
         app.handle_event(AppEvent::MicUsage { in_use: true, app: Some("Opera".into()) }, at_s(20));
         assert_eq!(app.end_generation, 2, "call voltou: a pergunta 1 não vale mais");
+        assert_eq!(*log.borrow(), vec!["ask_end 1".to_string(), "close_end".to_string()]);
         app.handle_event(AppEvent::EndAnswer { generation: 1, stop: true }, at_s(21));
+        assert!(matches!(app.screen, Screen::Recording(_)));
+    }
+
+    #[test]
+    fn parar_a_call_invalida_e_fecha_a_pergunta_de_fim() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = recording_call_app(d.path());
+        let log = fake_notifier(&mut app);
+        app.end_generation = 1;
+        app.handle_event(AppEvent::StopRecording, Instant::now());
+        assert!(matches!(app.screen, Screen::Processing(_)));
+        assert_eq!(*log.borrow(), vec!["close_end".to_string()]);
+
+        // outra call depois: o "Parar" atrasado da pergunta 1 não a para
+        let (mic, _) = crate::audio::record::temp_call_paths(d.path(), at(15, 0));
+        let rec = CallRecorder { mic: Recorder::fake(mic), system: None, system_note: None };
+        app.screen = Screen::Recording(Rec::Call(rec));
+        app.handle_event(AppEvent::EndAnswer { generation: 1, stop: true }, Instant::now());
         assert!(matches!(app.screen, Screen::Recording(_)));
     }
 
@@ -1425,11 +1465,16 @@ mod tests {
     #[test]
     fn estado_da_bandeja_conforme_a_tela() {
         let idle = App::with_state(Config::default(), vec![], Screen::Idle);
-        assert_eq!(idle.tray_state(), TrayState { recording: false, tooltip: "Tone Dial".into() });
+        assert_eq!(
+            idle.tray_state(),
+            TrayState { recording: false, can_record: true, tooltip: "Tone Dial".into() }
+        );
         assert_eq!(
             processing_app().tray_state(),
-            TrayState { recording: false, tooltip: "Transcrevendo…".into() }
+            TrayState { recording: false, can_record: false, tooltip: "Transcrevendo…".into() }
         );
+        let setup = App::with_state(Config::default(), vec![], Screen::Setup(SetupState::default()));
+        assert!(!setup.tray_state().can_record);
         let d = tempfile::tempdir().unwrap();
         let rec = recording_call_app(d.path()).tray_state();
         assert!(rec.recording);

@@ -14,6 +14,8 @@ const ICON_64: &[u8] = include_bytes!("../assets/icons/tonedial-64.png");
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrayState {
     pub recording: bool,
+    /// Falso processando ou preparando os modelos: "Gravar call" não faria nada.
+    pub can_record: bool,
     pub tooltip: String,
 }
 
@@ -98,7 +100,11 @@ impl ksni::Tray for ToneTray {
         let rec = if self.state.recording {
             item("Parar gravação", AppEvent::StopRecording)
         } else {
-            item("Gravar call", AppEvent::RecordCall)
+            let mut i = item("Gravar call", AppEvent::RecordCall);
+            if let MenuItem::Standard(s) = &mut i {
+                s.enabled = self.state.can_record;
+            }
+            i
         };
         vec![
             item("Abrir Tone Dial", AppEvent::ShowWindow),
@@ -128,7 +134,7 @@ impl TrayHandle {
 
 /// Sobe a bandeja. `None` se não deu (sem D-Bus ou sem StatusNotifierWatcher): o app continua.
 pub fn spawn(tx: Sender<AppEvent>) -> Option<TrayHandle> {
-    let state = TrayState { recording: false, tooltip: "Tone Dial".into() };
+    let state = TrayState { recording: false, can_record: true, tooltip: "Tone Dial".into() };
     let tray = ToneTray {
         state: state.clone(),
         tx,
@@ -147,6 +153,41 @@ pub fn spawn(tx: Sender<AppEvent>) -> Option<TrayHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn labels(state: TrayState) -> Vec<(String, bool)> {
+        let tray = ToneTray {
+            state,
+            tx: std::sync::mpsc::channel().0,
+            idle_icon: vec![],
+            recording_icon: vec![],
+        };
+        ksni::Tray::menu(&tray)
+            .into_iter()
+            .filter_map(|m| match m {
+                MenuItem::Standard(i) => Some((i.label, i.enabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_conforme_o_estado() {
+        let st = |recording, can_record| TrayState { recording, can_record, tooltip: String::new() };
+        let l = |v: &[(&str, bool)]| v.iter().map(|(s, e)| (s.to_string(), *e)).collect::<Vec<_>>();
+        assert_eq!(
+            labels(st(false, true)),
+            l(&[("Abrir Tone Dial", true), ("Gravar call", true), ("Sair", true)])
+        );
+        assert_eq!(
+            labels(st(true, false)),
+            l(&[("Abrir Tone Dial", true), ("Parar gravação", true), ("Sair", true)])
+        );
+        // processando ou preparando modelos: gravar não faria nada
+        assert_eq!(
+            labels(st(false, false)),
+            l(&[("Abrir Tone Dial", true), ("Gravar call", false), ("Sair", true)])
+        );
+    }
 
     #[test]
     fn rgba_vira_argb() {

@@ -4520,6 +4520,7 @@ dependencies = [
  "ureq",
  "whisper-rs",
  "whisper-rs-sys",
+ "zbus",
 ]
 
 [[package]]
