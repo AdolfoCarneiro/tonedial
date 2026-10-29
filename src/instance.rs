@@ -16,6 +16,12 @@ pub enum Instance {
 }
 
 pub fn acquire(path: &Path) -> std::io::Result<Instance> {
+    try_acquire(path, true)
+}
+
+/// `retry`: duas instâncias podem achar o mesmo socket velho; a que perder tenta de novo
+/// (e aí encontra a outra escutando).
+fn try_acquire(path: &Path, retry: bool) -> std::io::Result<Instance> {
     match UnixListener::bind(path) {
         Ok(l) => Ok(Instance::Primary(l)),
         Err(e) if e.kind() == ErrorKind::AddrInUse => match UnixStream::connect(path) {
@@ -25,10 +31,19 @@ pub fn acquire(path: &Path) -> std::io::Result<Instance> {
                 Ok(Instance::Secondary)
             }
             // ninguém escutando: sobrou de um processo que morreu
-            Err(_) => {
-                std::fs::remove_file(path)?;
-                Ok(Instance::Primary(UnixListener::bind(path)?))
+            Err(c) if c.kind() == ErrorKind::ConnectionRefused => {
+                let rebound = match std::fs::remove_file(path) {
+                    Ok(()) => UnixListener::bind(path),
+                    Err(e) if e.kind() == ErrorKind::NotFound => UnixListener::bind(path),
+                    Err(e) => Err(e),
+                };
+                match rebound {
+                    Ok(l) => Ok(Instance::Primary(l)),
+                    Err(_) if retry => try_acquire(path, false),
+                    Err(e) => Err(e),
+                }
             }
+            Err(c) => Err(c),
         },
         Err(e) => Err(e),
     }

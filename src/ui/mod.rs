@@ -118,6 +118,8 @@ pub struct App {
     /// WAV pendente esperando confirmação de "Descartar".
     confirm_discard: Option<PathBuf>,
     sleep_guard: Option<SleepGuard>,
+    /// Desligado no construtor puro, para os testes não chamarem o `systemd-inhibit`.
+    inhibit_enabled: bool,
     /// Aviso da preparação dos modelos (ex.: não apagou o f16), mostrado no Idle.
     setup_warning: Option<String>,
 }
@@ -219,6 +221,7 @@ impl App {
             pending: Vec::new(),
             confirm_discard: None,
             sleep_guard: None,
+            inhibit_enabled: false,
             setup_warning: None,
         }
     }
@@ -268,7 +271,7 @@ impl App {
 
     /// Liga/desliga o bloqueio de suspensão conforme a tela.
     fn sync_sleep_guard(&mut self) {
-        let want = inhibit_wanted(&self.screen, self.setup_rx.is_some());
+        let want = self.inhibit_enabled && inhibit_wanted(&self.screen, self.setup_rx.is_some());
         if want && self.sleep_guard.is_none() {
             self.sleep_guard = Some(SleepGuard::acquire("Gravando/processando áudio"));
         } else if !want {
@@ -308,6 +311,7 @@ impl App {
     pub fn new(events: (Sender<AppEvent>, Receiver<AppEvent>)) -> Self {
         let devices = list_input_devices();
         let mut app = App::with_events(Config::load(), devices, Screen::Idle, events);
+        app.inhibit_enabled = true;
         app.go_idle();
         app
     }
@@ -673,8 +677,11 @@ impl eframe::App for Shell {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if app.take_show_request() {
             // já está aberta: só traz para a frente
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+        // minimizada o `ui()` não roda; sem isto o `logic()` (e o tick) também pararia
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -869,16 +876,22 @@ mod tests {
         assert!(!busy.should_quit());
         assert!(busy.take_show_request());
         assert!(busy.confirm_close);
+        assert!(busy.sleep_guard.is_none(), "construtor puro não chama o systemd-inhibit");
     }
 
     #[test]
-    fn monitor_so_com_janela_aberta() {
-        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
-        app.window_opened();
-        assert!(app.window_open);
-        app.window_closed();
-        assert!(!app.window_open);
-        assert!(app.monitor.is_none());
+    fn abrir_a_janela_liga_o_monitor_so_no_idle() {
+        // sem microfones, tentar ligar o Monitor deixa o aviso: é o sinal de que tentou
+        let mut busy = processing_app();
+        busy.window_opened();
+        assert!(busy.mic_error.is_none());
+
+        let mut idle = App::with_state(Config::default(), vec![], Screen::Idle);
+        assert!(idle.mic_error.is_none());
+        idle.window_opened();
+        assert_eq!(idle.mic_error.as_deref(), Some("Nenhum microfone encontrado"));
+        idle.window_closed();
+        assert!(idle.monitor.is_none());
     }
 
     #[test]
