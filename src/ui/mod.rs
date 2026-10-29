@@ -178,6 +178,9 @@ pub struct App {
     detector: Detector,
     /// Número da última pergunta de fim; respostas de perguntas anteriores são ignoradas.
     end_generation: u64,
+    /// Número da pergunta de início que ainda vale; muda quando a sessão de uso acaba ou
+    /// alguma gravação começa, e o "Gravar" de uma pergunta velha é ignorado.
+    start_generation: u64,
     notifier: Box<dyn Notifier>,
     tray: Option<TrayHandle>,
 }
@@ -187,13 +190,16 @@ pub fn recording_title(started_at: NaiveDateTime) -> String {
     format!("Gravação de {}", started_at.format("%H:%M"))
 }
 
-/// "Gravação não processada de 28/10/2026 14:30 (12 min)".
-pub fn pending_label(started_at: NaiveDateTime, duration_ms: Option<u64>) -> String {
-    let base = format!("Gravação não processada de {}", started_at.format("%d/%m/%Y %H:%M"));
-    match duration_ms {
-        Some(ms) => format!("{base} ({})", format_duration_ms(ms)),
-        None => base,
+/// "Gravação não processada de 28/10/2026 14:30 (12 min)"; numa call, "... (12 min) (call)".
+pub fn pending_label(started_at: NaiveDateTime, duration_ms: Option<u64>, call: bool) -> String {
+    let mut out = format!("Gravação não processada de {}", started_at.format("%d/%m/%Y %H:%M"));
+    if let Some(ms) = duration_ms {
+        out.push_str(&format!(" ({})", format_duration_ms(ms)));
     }
+    if call {
+        out.push_str(" (call)");
+    }
+    out
 }
 
 /// Texto do modal de sair: gravando ou processando.
@@ -216,19 +222,22 @@ fn source_for(p: &Pending) -> Source {
 }
 
 /// Fonte de uma call que acabou de parar. Sem som do computador (ou com o WAV dele vazio,
-/// quando o `pw-record` morreu na hora) vira gravação só do mic, com aviso.
+/// quando o `pw-record` morreu na hora) vira gravação só do mic, com aviso. Só o WAV vazio
+/// é apagado; um que não deu para ler fica em `gravacoes/` (volta como pendente).
 fn source_after_call(
     mic: PathBuf,
     system: Option<PathBuf>,
     started_at: NaiveDateTime,
     note: Option<String>,
 ) -> (Source, Option<String>) {
-    let system = system.filter(|s| {
-        let ok = wav_duration_ms(s).is_some_and(|ms| ms > 0);
-        if !ok {
-            let _ = std::fs::remove_file(s);
+    let system = system.filter(|s| match wav_duration_ms(s) {
+        Some(ms) => {
+            if ms == 0 {
+                let _ = std::fs::remove_file(s);
+            }
+            ms > 0
         }
-        ok
+        None => false,
     });
     let note = if system.is_none() { Some(NO_SYSTEM_NOTE.to_string()) } else { note };
     (source_for(&Pending { wav: mic, started_at, duration_ms: None, system }), note)
@@ -313,6 +322,7 @@ impl App {
             call_after_show: false,
             detector: Detector::new(),
             end_generation: 0,
+            start_generation: 0,
             notifier: Box::new(SilentNotifier),
             tray: None,
         }
@@ -470,6 +480,11 @@ impl App {
                 }
             }
             AppEvent::RecordCall => self.record_call(),
+            AppEvent::StartAnswer { generation } => {
+                if generation == self.start_generation {
+                    self.record_call();
+                }
+            }
             AppEvent::StopRecording => self.stop_recording(None),
             AppEvent::MicUsage { in_use, app } => self.on_mic_usage(now, in_use, app.as_deref()),
             AppEvent::EndAnswer { generation, stop } => {
@@ -485,7 +500,12 @@ impl App {
         let call_recording = matches!(&self.screen, Screen::Recording(r) if r.is_call());
         let busy = matches!(self.screen, Screen::Recording(_) | Screen::Processing(_) | Screen::Setup(_));
         match self.detector.observe(now, in_use, app, DetectorCtx { busy, call_recording }) {
-            Some(DetectorAction::AskStart { app }) => self.notifier.ask_start(app.as_deref()),
+            Some(DetectorAction::AskStart { app }) => {
+                self.start_generation += 1;
+                self.notifier.ask_start(app.as_deref(), self.start_generation);
+            }
+            // a call acabou sem resposta: um "Gravar" tardio gravaria a sala vazia
+            Some(DetectorAction::SessionEnded) => self.start_call_question_over(),
             Some(DetectorAction::AskEnd) => {
                 self.end_generation += 1;
                 self.notifier.ask_end(self.end_generation);
@@ -494,6 +514,12 @@ impl App {
             Some(DetectorAction::CallBack) => self.end_call_question(),
             None => {}
         }
+    }
+
+    /// Invalida e fecha a pergunta de início pendente.
+    fn start_call_question_over(&mut self) {
+        self.start_generation += 1;
+        self.notifier.close_start();
     }
 
     /// Invalida e fecha a pergunta de fim pendente.
@@ -547,6 +573,17 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    /// Botão de fechar da janela. Com bandeja, só esconde. Sem bandeja não haveria como
+    /// voltar nem sair: vale como "Sair" (com a confirmação se grava ou processa).
+    /// `true` se o fechamento deve ser cancelado (o modal de confirmação aparece).
+    pub fn close_requested(&mut self, now: Instant) -> bool {
+        if self.tray.is_some() || self.quit {
+            return false;
+        }
+        self.handle_event(AppEvent::Quit, now);
+        !self.quit
     }
 
     fn selected_mic(&self) -> Option<String> {
@@ -721,6 +758,7 @@ impl App {
                 if r.is_call() {
                     self.end_generation += 1;
                 }
+                self.start_call_question_over();
                 self.screen = Screen::Recording(r);
             }
             Err(e) => self.screen = Screen::Error(format!("Não foi possível gravar: {e:#}")),
@@ -899,6 +937,9 @@ impl eframe::App for Shell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut app = self.0.borrow_mut();
         app.tick();
+        if ctx.input(|i| i.viewport().close_requested()) && app.close_requested(Instant::now()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if app.should_quit() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if app.take_show_request() {
@@ -1050,10 +1091,15 @@ mod tests {
     #[test]
     fn pending_label_text() {
         assert_eq!(
-            pending_label(at(14, 30), Some(720_000)),
+            pending_label(at(14, 30), Some(720_000), false),
             "Gravação não processada de 28/10/2026 14:30 (12 min)"
         );
-        assert_eq!(pending_label(at(14, 30), None), "Gravação não processada de 28/10/2026 14:30");
+        assert_eq!(pending_label(at(14, 30), None, false), "Gravação não processada de 28/10/2026 14:30");
+        assert_eq!(
+            pending_label(at(14, 30), Some(720_000), true),
+            "Gravação não processada de 28/10/2026 14:30 (12 min) (call)"
+        );
+        assert_eq!(pending_label(at(14, 30), None, true), "Gravação não processada de 28/10/2026 14:30 (call)");
     }
 
     #[test]
@@ -1224,6 +1270,14 @@ mod tests {
         let (src, _) = source_after_call(mic.clone(), Some(sis.clone()), at(14, 30), None);
         assert!(matches!(src, Source::Recording { .. }));
 
+        // WAV do sistema ilegível: vira só mic, com aviso, mas o arquivo fica
+        std::fs::write(&sis, b"isto nao e um wav").unwrap();
+        let (src, note) = source_after_call(mic.clone(), Some(sis.clone()), at(14, 30), None);
+        assert!(matches!(src, Source::Recording { .. }));
+        assert_eq!(note.as_deref(), Some(NO_SYSTEM_NOTE));
+        assert!(sis.exists(), "não apaga o que não conseguiu ler");
+        std::fs::remove_file(&sis).unwrap();
+
         // com som do computador: Call, e o aviso que veio passa adiante
         write_wav(&sis, 4800);
         let (src, note) = source_after_call(mic.clone(), Some(sis.clone()), at(14, 30), Some("parou".into()));
@@ -1280,8 +1334,11 @@ mod tests {
     struct FakeNotifier(Rc<RefCell<Vec<String>>>);
 
     impl Notifier for FakeNotifier {
-        fn ask_start(&self, app: Option<&str>) {
-            self.0.borrow_mut().push(format!("ask_start {app:?}"));
+        fn ask_start(&self, app: Option<&str>, generation: u64) {
+            self.0.borrow_mut().push(format!("ask_start {app:?} {generation}"));
+        }
+        fn close_start(&self) {
+            self.0.borrow_mut().push("close_start".into());
         }
         fn ask_end(&self, generation: u64) {
             self.0.borrow_mut().push(format!("ask_end {generation}"));
@@ -1435,7 +1492,7 @@ mod tests {
             let ev = AppEvent::MicUsage { in_use: true, app: Some("Opera".into()) };
             app.handle_event(ev, t0 + Duration::from_secs(s));
         }
-        assert_eq!(*log.borrow(), vec![r#"ask_start Some("Opera")"#.to_string()]);
+        assert_eq!(*log.borrow(), vec![r#"ask_start Some("Opera") 1"#.to_string()]);
 
         // processando: não pergunta
         let mut busy = processing_app();
@@ -1445,6 +1502,72 @@ mod tests {
             busy.handle_event(ev, t0 + Duration::from_secs(s));
         }
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn pergunta_de_inicio_fecha_quando_a_sessao_acaba_e_gravar_tardio_e_ignorado() {
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.config.output_dir = None; // RecordCall valendo pediria a janela
+        let log = fake_notifier(&mut app);
+        let t0 = Instant::now();
+        let at_s = |s: u64| t0 + Duration::from_secs(s);
+        for s in 0..=3 {
+            app.handle_event(AppEvent::MicUsage { in_use: true, app: None }, at_s(s));
+        }
+        for s in 4..=9 {
+            app.handle_event(AppEvent::MicUsage { in_use: false, app: None }, at_s(s));
+        }
+        assert_eq!(*log.borrow(), vec!["ask_start None 1".to_string(), "close_start".to_string()]);
+
+        // "Gravar" clicado no histórico depois que a call acabou: não grava
+        app.handle_event(AppEvent::StartAnswer { generation: 1 }, at_s(60));
+        assert!(!app.take_show_request());
+        assert!(!app.call_after_show);
+
+        // nova sessão: o "Gravar" dela vale
+        for s in 70..=73 {
+            app.handle_event(AppEvent::MicUsage { in_use: true, app: None }, at_s(s));
+        }
+        assert_eq!(log.borrow().last().map(String::as_str), Some("ask_start None 3"));
+        app.handle_event(AppEvent::StartAnswer { generation: 3 }, at_s(74));
+        assert!(app.take_show_request());
+        assert!(app.call_after_show);
+    }
+
+    #[test]
+    fn gravar_pela_bandeja_vale_mesmo_sem_pergunta() {
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.start_generation = 5;
+        app.handle_event(AppEvent::RecordCall, Instant::now());
+        assert!(app.call_after_show);
+    }
+
+    #[test]
+    fn gravacao_que_comeca_fecha_a_pergunta_de_inicio() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.config.output_dir = Some(d.path().to_path_buf());
+        app.recordings_dir = d.path().join("gravacoes");
+        app.start_generation = 1;
+        let log = fake_notifier(&mut app);
+        // gravação começa (sem mic de verdade, simula o fim do start_recording)
+        app.start_call_question_over();
+        assert_eq!(*log.borrow(), vec!["close_start".to_string()]);
+        app.handle_event(AppEvent::StartAnswer { generation: 1 }, Instant::now());
+        assert!(!matches!(app.screen, Screen::Recording(_)));
+        assert!(log.borrow().iter().all(|l| !l.starts_with("record_failed")), "não tentou gravar");
+    }
+
+    #[test]
+    fn sem_bandeja_fechar_a_janela_e_sair() {
+        let mut idle = App::with_state(Config::default(), vec![], Screen::Idle);
+        assert!(!idle.close_requested(Instant::now()), "parado: fecha");
+        assert!(idle.should_quit());
+
+        let mut busy = processing_app();
+        assert!(busy.close_requested(Instant::now()), "processando: cancela e pergunta");
+        assert!(busy.confirm_close);
+        assert!(!busy.should_quit());
     }
 
     #[test]

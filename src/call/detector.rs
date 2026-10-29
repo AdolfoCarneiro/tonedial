@@ -15,6 +15,8 @@ pub enum DetectorAction {
     AskStart { app: Option<String> },
     AskEnd,
     CallBack,
+    /// A sessão de uso que já tinha sido perguntada (ou vista ocupada) acabou: mic solto há 5 s.
+    SessionEnded,
 }
 
 #[derive(Default)]
@@ -58,7 +60,8 @@ impl Detector {
         }
         let free_for = self.free_since.map(|t| now.duration_since(t));
         // a sessão de uso só acaba depois de 5 s solto
-        if free_for.is_some_and(|d| d >= SOLTO_ATE_FIM) {
+        let session_ended = self.asked_start && free_for.is_some_and(|d| d >= SOLTO_ATE_FIM);
+        if session_ended {
             self.asked_start = false;
         }
         // uso visto com o app ocupado: ao terminar, não pergunta pela mesma sessão
@@ -87,6 +90,9 @@ impl Detector {
             return None;
         }
 
+        if session_ended {
+            return Some(DetectorAction::SessionEnded);
+        }
         if in_use && !ctx.busy && !self.asked_start {
             let since = self.in_use_since?;
             if now.duration_since(since) >= USO_ATE_PERGUNTAR {
@@ -149,9 +155,10 @@ mod tests {
         for s in 0..=3 {
             d.observe(c.t(s), true, None, idle());
         }
-        for s in 10..=15 {
+        for s in 10..=14 {
             assert_eq!(d.observe(c.t(s), false, None, idle()), None);
         }
+        assert_eq!(d.observe(c.t(15), false, None, idle()), Some(DetectorAction::SessionEnded));
         for s in 16..=18 {
             assert_eq!(d.observe(c.t(s), true, None, idle()), None);
         }
@@ -159,6 +166,32 @@ mod tests {
             d.observe(c.t(19), true, None, idle()),
             Some(DetectorAction::AskStart { app: None })
         );
+    }
+
+    #[test]
+    fn sessao_perguntada_avisa_quando_acaba() {
+        let (c, mut d) = (clock(), Detector::new());
+        for s in 0..=3 {
+            d.observe(c.t(s), true, None, idle());
+        }
+        for s in 4..=8 {
+            assert_eq!(d.observe(c.t(s), false, None, idle()), None);
+        }
+        assert_eq!(d.observe(c.t(9), false, None, idle()), Some(DetectorAction::SessionEnded));
+        for s in 10..=60 {
+            assert_eq!(d.observe(c.t(s), false, None, idle()), None, "só uma vez");
+        }
+    }
+
+    #[test]
+    fn sessao_sem_pergunta_nao_avisa_o_fim() {
+        let (c, mut d) = (clock(), Detector::new());
+        for s in 0..2 {
+            d.observe(c.t(s), true, None, idle());
+        }
+        for s in 2..=60 {
+            assert_eq!(d.observe(c.t(s), false, None, idle()), None);
+        }
     }
 
     #[test]
@@ -249,7 +282,12 @@ mod tests {
             d.observe(c.t(s), true, None, rec());
         }
         d.observe(c.t(10), true, None, idle());
-        for s in 11..=600 {
+        for s in 11..=15 {
+            assert_eq!(d.observe(c.t(s), false, None, idle()), None);
+        }
+        // a sessão vista durante a gravação acaba (só fecha uma pergunta de início, se houver)
+        assert_eq!(d.observe(c.t(16), false, None, idle()), Some(DetectorAction::SessionEnded));
+        for s in 17..=600 {
             assert_eq!(d.observe(c.t(s), false, None, idle()), None);
         }
         for s in 601..=1200 {

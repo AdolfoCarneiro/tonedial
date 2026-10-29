@@ -35,35 +35,18 @@ fn show(n: Notification, on_action: impl FnOnce(&str) + Send + 'static) {
     });
 }
 
-pub fn ask_start(app: Option<&str>, tx: Sender<AppEvent>) {
-    let mut n = base("Tone Dial", &start_body(app));
-    n.action("gravar", "Gravar").action("agora-nao", "Agora não");
-    show(n, move |a| {
-        if a == "gravar" {
-            let _ = tx.send(AppEvent::RecordCall);
-        }
-    });
-}
+/// Id da notificação mostrada, para poder fechá-la depois.
+pub type ShownId = Arc<Mutex<Option<u32>>>;
 
-/// Id da última pergunta de fim mostrada, para `close_end` poder fechá-la.
-pub type EndId = Arc<Mutex<Option<u32>>>;
-
-pub fn ask_end(generation: u64, tx: Sender<AppEvent>, end_id: EndId) {
-    let mut n = base("Tone Dial", "A call acabou? Parar e processar?");
-    n.action("parar", "Parar").action("continuar", "Continuar gravando");
+/// Mostra, guarda o id em `shown` e espera o clique numa thread. Ao terminar (clique,
+/// fechada ou expirada), esquece o id se ainda for o dela.
+fn show_tracked(n: Notification, shown: ShownId, on_action: impl FnOnce(&str) + Send + 'static) {
     std::thread::spawn(move || match n.show() {
         Ok(h) => {
             let id = h.id();
-            *end_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
-            h.wait_for_action(|a| {
-                let stop = match a {
-                    "parar" => true,
-                    "continuar" => false,
-                    _ => return,
-                };
-                let _ = tx.send(AppEvent::EndAnswer { generation, stop });
-            });
-            let mut cur = end_id.lock().unwrap_or_else(|e| e.into_inner());
+            *shown.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+            h.wait_for_action(on_action);
+            let mut cur = shown.lock().unwrap_or_else(|e| e.into_inner());
             if *cur == Some(id) {
                 *cur = None;
             }
@@ -72,9 +55,33 @@ pub fn ask_end(generation: u64, tx: Sender<AppEvent>, end_id: EndId) {
     });
 }
 
-/// Fecha a pergunta de fim que ainda estiver na tela (a call voltou ou a gravação parou).
-pub fn close_end(end_id: &EndId) {
-    let Some(id) = end_id.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+/// `generation` identifica a pergunta: um "Gravar" de uma sessão de uso que já acabou não vale.
+pub fn ask_start(app: Option<&str>, generation: u64, tx: Sender<AppEvent>, start_id: ShownId) {
+    let mut n = base("Tone Dial", &start_body(app));
+    n.action("gravar", "Gravar").action("agora-nao", "Agora não");
+    show_tracked(n, start_id, move |a| {
+        if a == "gravar" {
+            let _ = tx.send(AppEvent::StartAnswer { generation });
+        }
+    });
+}
+
+pub fn ask_end(generation: u64, tx: Sender<AppEvent>, end_id: ShownId) {
+    let mut n = base("Tone Dial", "A call acabou? Parar e processar?");
+    n.action("parar", "Parar").action("continuar", "Continuar gravando");
+    show_tracked(n, end_id, move |a| {
+        let stop = match a {
+            "parar" => true,
+            "continuar" => false,
+            _ => return,
+        };
+        let _ = tx.send(AppEvent::EndAnswer { generation, stop });
+    });
+}
+
+/// Fecha a notificação que ainda estiver na tela (pergunta de início ou de fim).
+pub fn close_shown(shown: &ShownId) {
+    let Some(id) = shown.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
     std::thread::spawn(move || {
         let r = zbus::blocking::Connection::session().and_then(|c| {
             c.call_method(
@@ -129,7 +136,9 @@ pub fn record_failed(msg: &str, tx: Sender<AppEvent>) {
 
 /// O que o `App` usa para avisar; nos testes, uma implementação falsa sem D-Bus.
 pub trait Notifier {
-    fn ask_start(&self, app: Option<&str>);
+    fn ask_start(&self, app: Option<&str>, generation: u64);
+    /// Fecha a pergunta de início pendente, se houver.
+    fn close_start(&self);
     fn ask_end(&self, generation: u64);
     /// Fecha a pergunta de fim pendente, se houver.
     fn close_end(&self);
@@ -141,26 +150,31 @@ pub trait Notifier {
 
 pub struct DesktopNotifier {
     tx: Sender<AppEvent>,
-    end_id: EndId,
+    start_id: ShownId,
+    end_id: ShownId,
 }
 
 impl DesktopNotifier {
     pub fn new(tx: Sender<AppEvent>) -> Self {
-        DesktopNotifier { tx, end_id: EndId::default() }
+        DesktopNotifier { tx, start_id: ShownId::default(), end_id: ShownId::default() }
     }
 }
 
 impl Notifier for DesktopNotifier {
-    fn ask_start(&self, app: Option<&str>) {
-        ask_start(app, self.tx.clone());
+    fn ask_start(&self, app: Option<&str>, generation: u64) {
+        close_shown(&self.start_id);
+        ask_start(app, generation, self.tx.clone(), self.start_id.clone());
+    }
+    fn close_start(&self) {
+        close_shown(&self.start_id);
     }
     fn ask_end(&self, generation: u64) {
         // uma pergunta por vez: a anterior (se ainda aberta) sai da tela
-        close_end(&self.end_id);
+        close_shown(&self.end_id);
         ask_end(generation, self.tx.clone(), self.end_id.clone());
     }
     fn close_end(&self) {
-        close_end(&self.end_id);
+        close_shown(&self.end_id);
     }
     fn done(&self, md: &Path, notices: &[String]) {
         done(md, notices);
@@ -177,7 +191,8 @@ impl Notifier for DesktopNotifier {
 pub struct SilentNotifier;
 
 impl Notifier for SilentNotifier {
-    fn ask_start(&self, _: Option<&str>) {}
+    fn ask_start(&self, _: Option<&str>, _: u64) {}
+    fn close_start(&self) {}
     fn ask_end(&self, _: u64) {}
     fn close_end(&self) {}
     fn done(&self, _: &Path, _: &[String]) {}
@@ -193,14 +208,14 @@ mod tests {
     #[test]
     #[ignore = "mostra uma notificação de verdade"]
     fn pergunta_de_fim_fecha_pelo_dbus() {
-        let end_id = EndId::default();
+        let end_id = ShownId::default();
         ask_end(1, std::sync::mpsc::channel().0, end_id.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while end_id.lock().unwrap().is_none() {
             assert!(std::time::Instant::now() < deadline, "notificação não apareceu");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        close_end(&end_id);
+        close_shown(&end_id);
         assert!(end_id.lock().unwrap().is_none());
         std::thread::sleep(std::time::Duration::from_secs(1));
     }

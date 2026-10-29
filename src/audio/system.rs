@@ -123,6 +123,13 @@ fn read_loop(
     let result = loop {
         let Some((mut child, stdout)) = current.take() else { break Ok(()) };
         let r = pump(stdout, &mut sink, &mut meter, &mut written, reference);
+        // tira o grupo antes do wait: depois de colhido, o pgid pode ser reusado por outro
+        // processo e o stop() mataria o grupo errado. Ainda não colhido, o grupo é nosso:
+        // mata o que sobrou dele para o wait não ficar preso.
+        if let Some(pg) = lock(&shared.pgid).take() {
+            // SAFETY: o líder do grupo ainda não foi colhido, então o grupo é o que criamos.
+            unsafe { libc::kill(-pg, libc::SIGKILL) };
+        }
         let _ = child.wait();
         if let Err(e) = r {
             break Err(e);
@@ -248,6 +255,17 @@ mod tests {
         let r = SystemRecorder::start_with(|| Command::new("/nao/existe/pw-record"), p.clone(), Instant::now());
         assert!(r.is_err());
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn system_recorder_esquece_o_grupo_depois_que_o_processo_morre() {
+        let p = tmp("grupo");
+        let r = SystemRecorder::start_with(sh("head -c 4800 /dev/zero"), p, Instant::now()).unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(r.stopped_at().is_some());
+        assert_eq!(*lock(&r.shared.pgid), None);
+        let out = r.stop().unwrap();
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

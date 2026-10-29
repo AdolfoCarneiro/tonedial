@@ -27,7 +27,7 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    super::pending_label(p.started_at, p.duration_ms),
+                    super::pending_label(p.started_at, p.duration_ms, p.system.is_some()),
                 );
                 if ui.button("Processar").clicked() {
                     process_pending = Some(i);

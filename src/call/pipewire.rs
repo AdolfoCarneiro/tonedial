@@ -98,8 +98,9 @@ pub fn mic_users(dump_json: &str, own_pid: u32) -> Result<Vec<MicUser>> {
             continue;
         }
         let client = as_pid(p.get("client.id")).and_then(|c| clients.get(&c));
+        // pipewire.sec.pid é o pid no host; application.process.id, no Flatpak, é o do sandbox
         let pid = client.and_then(|c| {
-            as_pid(c.get("application.process.id")).or_else(|| as_pid(c.get("pipewire.sec.pid")))
+            as_pid(c.get("pipewire.sec.pid")).or_else(|| as_pid(c.get("application.process.id")))
         });
         if pid.is_some_and(|pid| is_own(pid, own_pid)) {
             continue;
@@ -192,6 +193,33 @@ mod tests {
         assert!(!log_failure(&mut failing, true));
         assert!(!log_failure(&mut failing, false));
         assert!(log_failure(&mut failing, true), "falha depois de um sucesso");
+    }
+
+    fn dump_com_cliente(client_props: serde_json::Value) -> String {
+        serde_json::json!([
+            { "id": 10, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Audio/Source" } } },
+            { "id": 20, "type": "PipeWire:Interface:Client", "info": { "props": client_props } },
+            { "id": 30, "type": "PipeWire:Interface:Node",
+              "info": { "props": { "media.class": "Stream/Input/Audio", "client.id": 20 } } },
+            { "id": 40, "type": "PipeWire:Interface:Link",
+              "info": { "output-node-id": 10, "input-node-id": 30 } }
+        ])
+        .to_string()
+    }
+
+    #[test]
+    fn prefere_o_pid_do_host_ao_do_sandbox() {
+        // no Flatpak, application.process.id é o pid dentro do sandbox
+        let j = dump_com_cliente(serde_json::json!({
+            "application.name": "Teams", "application.process.id": 2, "pipewire.sec.pid": 4242
+        }));
+        assert_eq!(mic_users(&j, 99999).unwrap()[0].pid, Some(4242));
+    }
+
+    #[test]
+    fn sem_pid_do_host_usa_o_do_app() {
+        let j = dump_com_cliente(serde_json::json!({ "application.process.id": 4242 }));
+        assert_eq!(mic_users(&j, 99999).unwrap()[0].pid, Some(4242));
     }
 
     #[test]

@@ -4,8 +4,10 @@
 pub enum AppEvent {
     ShowWindow,
     Quit,
-    /// Gravar call (bandeja ou notificação).
+    /// Gravar call (bandeja). Sempre vale.
     RecordCall,
+    /// "Gravar" na pergunta de início; `generation` identifica a pergunta (a sessão de uso).
+    StartAnswer { generation: u64 },
     /// Parar a gravação atual (bandeja).
     StopRecording,
     /// Amostra do observador do PipeWire.
