@@ -27,7 +27,7 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    super::pending_label(p.started_at, p.duration_ms),
+                    super::pending_label(p.started_at, p.duration_ms, p.system.is_some()),
                 );
                 if ui.button("Processar").clicked() {
                     process_pending = Some(i);
@@ -57,16 +57,34 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
     if let Some(e) = &app.mic_error {
         ui.colored_label(ui.visuals().warn_fg_color, e);
     }
+    let mut record_system = app.config.record_system;
+    let toggled = ui
+        .add_enabled(!recording, egui::Checkbox::new(&mut record_system, "Gravar também o som do computador (call)"))
+        .changed();
     ui.add_space(8.0);
 
-    let (levels, elapsed) = match &app.screen {
-        Screen::Recording(r) => (r.levels.snapshot(), r.elapsed()),
-        _ => (
-            app.monitor.as_ref().map(|m| m.levels.snapshot()).unwrap_or_default(),
-            Duration::ZERO,
+    match &app.screen {
+        Screen::Recording(r) if r.is_call() => {
+            let (mic, system) = r.levels();
+            ui.small("Você");
+            draw_levels(ui, &mic.snapshot(), 50.0);
+            ui.small("Call");
+            draw_levels(ui, &system.map(|l| l.snapshot()).unwrap_or_default(), 50.0);
+            if let Some(n) = r.note() {
+                ui.colored_label(ui.visuals().warn_fg_color, n);
+            }
+        }
+        Screen::Recording(r) => draw_levels(ui, &r.levels().0.snapshot(), 110.0),
+        _ => draw_levels(
+            ui,
+            &app.monitor.as_ref().map(|m| m.levels.snapshot()).unwrap_or_default(),
+            110.0,
         ),
+    }
+    let elapsed = match &app.screen {
+        Screen::Recording(r) => r.elapsed(),
+        _ => Duration::ZERO,
     };
-    draw_levels(ui, &levels);
 
     ui.add_space(8.0);
     ui.vertical_centered(|ui| {
@@ -138,6 +156,10 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
     if let Some(m) = new_mic {
         app.set_mic(m);
     }
+    if toggled {
+        app.config.record_system = record_system;
+        app.save_config();
+    }
     if change_dir {
         app.pick_output_dir();
     }
@@ -152,7 +174,7 @@ pub fn layout(app: &mut App, ui: &mut egui::Ui, recording: bool) {
         if recording {
             app.stop_recording(None);
         } else {
-            app.start_recording();
+            app.start_recording(app.config.record_system);
         }
         return;
     }

@@ -1,10 +1,16 @@
 pub mod asr;
 pub mod audio;
+pub mod autostart;
+pub mod call;
 pub mod config;
 pub mod diarize;
+pub mod events;
 pub mod inhibit;
+pub mod instance;
 pub mod models;
 pub mod naming;
+pub mod notify;
 pub mod pipeline;
 pub mod transcript;
+pub mod tray;
 pub mod ui;

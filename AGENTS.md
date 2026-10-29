@@ -25,7 +25,6 @@ O nome vem de One Piece: o Tone Dial é a concha de Skypiea que grava um som e t
 ## Depois (não é v1)
 
 - Saber quando quem fala sou eu (com uma amostra da minha voz) e, mais para frente, quem é quem pelo nome.
-- Gravar call: pegar o áudio do sistema junto com o microfone (PipeWire).
 
 ## Fora
 
@@ -47,7 +46,7 @@ Notebook com Fedora KDE e uma **RTX 2050 (4 GB de VRAM)**, com CUDA.
 
 ## Estado
 
-v1 implementada na branch `feat/v1` (2026-10-28): janela, gravação, transcrição e separação de falantes. Modelos conforme `docs/superpowers/specs/2026-10-28-comparacao-modelos.md`. Instalação e uso no `README.md`.
+v1 implementada na branch `feat/v1` (2026-10-28): janela, gravação, transcrição e separação de falantes. Modelos conforme `docs/superpowers/specs/2026-10-28-comparacao-modelos.md`. Gravar call (mic + som do sistema, bandeja, detecção) implementada na branch `feat/calls` (2026-10-28); spec em `docs/superpowers/specs/2026-10-28-gravar-calls-design.md`. Instalação e uso no `README.md`.
 
 ## Convenções
 

@@ -15,7 +15,7 @@ const MAX_LEVELS: usize = 300;
 /// Um valor de pico a cada ~33 ms.
 const LEVEL_WINDOW_MS: u64 = 33;
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -108,7 +108,7 @@ impl Levels {
 }
 
 /// Acumula picos e publica um valor a cada janela de ~33 ms.
-struct Meter {
+pub(crate) struct Meter {
     levels: Levels,
     window: usize,
     count: usize,
@@ -116,12 +116,12 @@ struct Meter {
 }
 
 impl Meter {
-    fn new(levels: Levels, sample_rate: u32) -> Self {
+    pub(crate) fn new(levels: Levels, sample_rate: u32) -> Self {
         let window = (sample_rate as u64 * LEVEL_WINDOW_MS / 1000).max(1) as usize;
         Meter { levels, window, count: 0, peak: 0.0 }
     }
 
-    fn feed(&mut self, mono: &[f32]) {
+    pub(crate) fn feed(&mut self, mono: &[f32]) {
         for &s in mono {
             self.peak = self.peak.max(s.abs());
             self.count += 1;
@@ -190,21 +190,54 @@ pub fn temp_wav_path(dir: &Path, at: NaiveDateTime) -> PathBuf {
     dir.join(format!("{WAV_PREFIX}{}.wav", at.format(WAV_TIME_FORMAT)))
 }
 
+/// `(mic, sistema)`: `<dir>/gravacao-<AAAAMMDD-HHMMSS>-mic.wav` e `...-sistema.wav`.
+pub fn temp_call_paths(dir: &Path, at: NaiveDateTime) -> (PathBuf, PathBuf) {
+    let stamp = at.format(WAV_TIME_FORMAT);
+    (
+        dir.join(format!("{WAV_PREFIX}{stamp}-mic.wav")),
+        dir.join(format!("{WAV_PREFIX}{stamp}-sistema.wav")),
+    )
+}
+
+/// Gravação que não chegou a virar .ogg. Em call, `wav` é o mic e `system` o som do computador.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingAudio {
+    pub started_at: NaiveDateTime,
+    pub wav: PathBuf,
+    pub system: Option<PathBuf>,
+}
+
 /// WAVs de gravações que não chegaram a virar .ogg (app fechado, falha...), mais antigos primeiro.
-pub fn pending_recordings(dir: &Path) -> Vec<(PathBuf, NaiveDateTime)> {
+/// Os dois WAVs de uma call viram um item só; um lado sozinho vira gravação simples.
+pub fn pending_recordings(dir: &Path) -> Vec<PendingAudio> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut out: Vec<(PathBuf, NaiveDateTime)> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter_map(|p| {
-            let name = p.file_name()?.to_str()?;
-            let ts = name.strip_prefix(WAV_PREFIX)?.strip_suffix(".wav")?;
-            let at = NaiveDateTime::parse_from_str(ts, WAV_TIME_FORMAT).ok()?;
-            Some((p, at))
-        })
-        .collect();
-    out.sort_by_key(|(_, at)| *at);
+    // por carimbo: (simples, mic, sistema)
+    let mut groups: std::collections::BTreeMap<NaiveDateTime, [Option<PathBuf>; 3]> = Default::default();
+    for p in entries.flatten().map(|e| e.path()).filter(|p| p.is_file()) {
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(stem) = name.strip_prefix(WAV_PREFIX).and_then(|n| n.strip_suffix(".wav")) else { continue };
+        let (ts, slot) = if let Some(t) = stem.strip_suffix("-mic") {
+            (t, 1)
+        } else if let Some(t) = stem.strip_suffix("-sistema") {
+            (t, 2)
+        } else {
+            (stem, 0)
+        };
+        let Ok(at) = NaiveDateTime::parse_from_str(ts, WAV_TIME_FORMAT) else { continue };
+        groups.entry(at).or_default()[slot] = Some(p);
+    }
+    let mut out = Vec::new();
+    for (started_at, [simple, mic, sis]) in groups {
+        match (simple, mic, sis) {
+            (simple, Some(mic), Some(sis)) => {
+                out.push(PendingAudio { started_at, wav: mic, system: Some(sis) });
+                out.extend(simple.map(|wav| PendingAudio { started_at, wav, system: None }));
+            }
+            (simple, mic, sis) => {
+                out.extend(simple.or(mic).or(sis).map(|wav| PendingAudio { started_at, wav, system: None }));
+            }
+        }
+    }
     out
 }
 
@@ -462,8 +495,32 @@ impl Recorder {
         })
     }
 
+    /// Gravador sem microfone (testes): o WAV fica vazio, e o `stop` funciona como o de verdade.
+    #[cfg(test)]
+    pub(crate) fn fake(wav_path: PathBuf) -> Recorder {
+        let sink = WavSink::create(&wav_path, 48_000).expect("WAV do gravador falso");
+        let failure: Arc<Mutex<Option<Failure>>> = Arc::default();
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let fail_w = failure.clone();
+        Recorder {
+            levels: Levels::default(),
+            wav_path,
+            started_at: Local::now().naive_local(),
+            started: Instant::now(),
+            failure,
+            tx,
+            writer: Some(std::thread::spawn(move || writer_loop(rx, sink, fail_w))),
+            capture: None,
+        }
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// Instante do primeiro bloco do microfone: referência de sincronia para o som do computador.
+    pub(crate) fn started_instant(&self) -> Instant {
+        self.started
     }
 
     /// Motivo, se o microfone sumiu ou a escrita falhou.
@@ -636,7 +693,52 @@ mod tests {
         std::fs::write(d.path().join("outro.wav"), b"x").unwrap();
         std::fs::write(d.path().join("gravacao-lixo.wav"), b"x").unwrap();
         std::fs::write(d.path().join("gravacao-20261028-090507.ogg"), b"x").unwrap();
-        assert_eq!(pending_recordings(d.path()), vec![(b, at(9, 5, 7)), (a, at(14, 30, 0))]);
+        assert_eq!(
+            pending_recordings(d.path()),
+            vec![
+                PendingAudio { started_at: at(9, 5, 7), wav: b, system: None },
+                PendingAudio { started_at: at(14, 30, 0), wav: a, system: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn pendentes_agrupam_par_de_call() {
+        let d = tempfile::tempdir().unwrap();
+        let (mic, sis) = temp_call_paths(d.path(), at(14, 30, 5));
+        let simples = temp_wav_path(d.path(), at(15, 0, 0));
+        for p in [&mic, &sis, &simples] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        assert_eq!(
+            pending_recordings(d.path()),
+            vec![
+                PendingAudio { started_at: at(14, 30, 5), wav: mic, system: Some(sis) },
+                PendingAudio { started_at: at(15, 0, 0), wav: simples, system: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn par_incompleto_vira_gravacao_simples() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, sis) = temp_call_paths(d.path(), at(14, 30, 5));
+        std::fs::write(&sis, b"x").unwrap();
+        assert_eq!(
+            pending_recordings(d.path()),
+            vec![PendingAudio { started_at: at(14, 30, 5), wav: sis, system: None }]
+        );
+    }
+
+    #[test]
+    fn temp_call_paths_usa_o_mesmo_carimbo() {
+        assert_eq!(
+            temp_call_paths(Path::new("/g"), at(14, 30, 5)),
+            (
+                PathBuf::from("/g/gravacao-20261028-143005-mic.wav"),
+                PathBuf::from("/g/gravacao-20261028-143005-sistema.wav")
+            )
+        );
     }
 
     #[test]

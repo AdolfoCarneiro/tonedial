@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub output_dir: Option<PathBuf>,
     pub last_mic: Option<String>,
+    /// Gravar também o som do computador (call).
+    #[serde(default)]
+    pub record_system: bool,
 }
 
 impl Config {
@@ -54,7 +57,11 @@ mod tests {
     fn config_roundtrip() {
         let d = std::env::temp_dir().join(format!("td-cfg-{}", std::process::id()));
         let p = d.join("sub/config.json");
-        let c = Config { output_dir: Some("/x/y".into()), last_mic: Some("Mic".into()) };
+        let c = Config {
+            output_dir: Some("/x/y".into()),
+            last_mic: Some("Mic".into()),
+            record_system: true,
+        };
         c.save_to(&p).unwrap();
         assert_eq!(Config::load_from(&p), c);
         let _ = std::fs::remove_dir_all(&d);
@@ -69,5 +76,15 @@ mod tests {
         assert_eq!(Config::load_from(&p), Config::default());
         assert_eq!(Config::load_from(&d.join("nao-existe.json")), Config::default());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn config_antigo_sem_record_system_carrega() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.json");
+        std::fs::write(&p, r#"{"output_dir":"/x","last_mic":null}"#).unwrap();
+        let c = Config::load_from(&p);
+        assert_eq!(c.output_dir.as_deref(), Some(std::path::Path::new("/x")));
+        assert!(!c.record_system);
     }
 }
