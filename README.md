@@ -10,7 +10,7 @@ sudo dnf install -y clang glslc alsa-lib-devel vulkan-loader-devel ffmpeg
 
 Também precisa do Rust (cargo). Se o build não achar a libclang: `export LIBCLANG_PATH=/usr/lib64`.
 
-A GPU é usada via Vulkan (sem CUDA). Ela só entra se houver VRAM livre suficiente (tamanho do modelo + 1 GiB); senão roda na CPU, mais devagar. `TONEDIAL_GPU_DEVICE=N` escolhe outro dispositivo Vulkan.
+A GPU é usada via Vulkan (sem CUDA). Ela só entra se houver VRAM livre suficiente (tamanho do modelo + 1,5 GiB); senão roda na CPU, mais devagar. `TONEDIAL_GPU_DEVICE=N` escolhe outro dispositivo Vulkan.
 
 ## Instalar
 

@@ -60,7 +60,7 @@ fn load_context(path: &Path, use_gpu: bool) -> Result<WhisperContext> {
 /// Folga fixa de VRAM além do tamanho do modelo (buffers de computação do beam 5, KV cache,
 /// estado do VAD). Conservadora de propósito: um OOM do Vulkan durante `full` provavelmente
 /// aborta o processo (exceção do ggml-vulkan atravessando a fronteira C) e o fallback não pega.
-const GPU_MARGIN_BYTES: u64 = 1 << 30;
+const GPU_MARGIN_BYTES: u64 = 3 << 29; // 1,5 GiB: pico medido de ~3,05 GiB com o large-v3 q8_0 (1,66 GB)
 
 /// Decide se vale tentar a GPU: VRAM livre precisa cobrir o modelo mais a folga.
 fn should_use_gpu(free_bytes: u64, model_bytes: u64) -> bool {
@@ -653,7 +653,11 @@ mod tests {
         let gib = 1u64 << 30;
         assert!(!should_use_gpu(1_789_919_232, 1_700_000_000)); // RTX 2050 com desktop aberto
         assert!(should_use_gpu(4 * gib, 1_700_000_000));
-        assert!(should_use_gpu(2 * gib, gib));
+        // Folga de 1,5 GiB: o large-v3 q8_0 (1,66 GB) chegou a ~3,05 GiB de pico.
+        assert!(!should_use_gpu(3 * gib, 1_656_538_283));
+        assert!(should_use_gpu(3 * gib + gib / 4, 1_656_538_283));
+        assert!(should_use_gpu(gib * 5 / 2, gib));
+        assert!(!should_use_gpu(gib * 5 / 2 - 1, gib));
         assert!(!should_use_gpu(gib, gib));
         assert!(!should_use_gpu(0, u64::MAX));
     }
