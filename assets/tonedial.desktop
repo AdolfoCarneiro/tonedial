@@ -3,6 +3,6 @@ Type=Application
 Name=Tone Dial
 Comment=Grava ou abre um áudio, transcreve e separa quem falou (local)
 Exec=tonedial
-Icon=audio-input-microphone
+Icon=tonedial
 Categories=AudioVideo;Audio;
 Terminal=false

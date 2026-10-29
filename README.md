@@ -19,6 +19,8 @@ cargo install --path .
 mkdir -p ~/.local/share/applications
 sed "s|^Exec=tonedial|Exec=$HOME/.cargo/bin/tonedial|" assets/tonedial.desktop > ~/.local/share/applications/tonedial.desktop
 update-desktop-database ~/.local/share/applications
+for n in 16 32 48 64 128 256 512; do install -Dm644 assets/icons/tonedial-$n.png ~/.local/share/icons/hicolor/${n}x${n}/apps/tonedial.png; done
+install -Dm644 assets/icons/tonedial.svg ~/.local/share/icons/hicolor/scalable/apps/tonedial.svg
 ```
 
 Isso instala `tonedial` (a janela) e `tonedial-cli` (ferramenta de desenvolvimento) em `~/.cargo/bin`. O `sed` grava o caminho absoluto no `Exec` da cópia instalada, porque o ambiente da sessão do KDE normalmente não tem `~/.cargo/bin` no PATH (o `Exec=tonedial` do `assets/tonedial.desktop` só funciona se tiver).
