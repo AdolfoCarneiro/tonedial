@@ -7,8 +7,10 @@ mod processing;
 mod recording;
 mod setup;
 
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
@@ -19,6 +21,7 @@ use crate::audio::record::{
     temp_wav_path, wav_duration_ms,
 };
 use crate::config::Config;
+use crate::events::AppEvent;
 use crate::inhibit::SleepGuard;
 use crate::models::{SetupProgress, ensure_models, missing_models, models_dir};
 use crate::pipeline::{self, Job, Outcome, Progress, Source, Stage};
@@ -99,8 +102,13 @@ pub struct App {
     config: Config,
     devices: Vec<String>,
     monitor: Option<Monitor>,
+    /// Modal "Sair?" (um `Quit` chegou com algo em andamento).
     confirm_close: bool,
-    force_close: bool,
+    events_tx: Sender<AppEvent>,
+    events_rx: Receiver<AppEvent>,
+    window_open: bool,
+    show_requested: bool,
+    quit: bool,
     models_dir: PathBuf,
     mic_error: Option<String>,
     setup_rx: Option<Receiver<SetupProgress>>,
@@ -128,12 +136,12 @@ pub fn pending_label(started_at: NaiveDateTime, duration_ms: Option<u64>) -> Str
     }
 }
 
-/// Texto do modal de fechar: gravando ou processando.
-pub fn close_message(recording: bool) -> &'static str {
+/// Texto do modal de sair: gravando ou processando.
+pub fn quit_message(recording: bool) -> &'static str {
     if recording {
-        "Parar a gravação e fechar? O áudio fica salvo e você pode processar depois."
+        "Parar a gravação e sair? O áudio fica salvo e você pode processar depois."
     } else {
-        "Fechar agora? O processamento será perdido, mas o áudio continua salvo."
+        "Sair agora? O processamento será perdido, mas o áudio continua salvo."
     }
 }
 
@@ -183,13 +191,26 @@ pub fn format_duration_ms(ms: u64) -> String {
 impl App {
     /// Construtor puro (sem áudio, sem threads): usado também nos testes.
     pub fn with_state(config: Config, devices: Vec<String>, screen: Screen) -> Self {
+        App::with_events(config, devices, screen, mpsc::channel())
+    }
+
+    fn with_events(
+        config: Config,
+        devices: Vec<String>,
+        screen: Screen,
+        (events_tx, events_rx): (Sender<AppEvent>, Receiver<AppEvent>),
+    ) -> Self {
         App {
             screen,
             config,
             devices,
             monitor: None,
             confirm_close: false,
-            force_close: false,
+            events_tx,
+            events_rx,
+            window_open: false,
+            show_requested: false,
+            quit: false,
             models_dir: models_dir(),
             mic_error: None,
             setup_rx: None,
@@ -284,11 +305,77 @@ impl App {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new(events: (Sender<AppEvent>, Receiver<AppEvent>)) -> Self {
         let devices = list_input_devices();
-        let mut app = App::with_state(Config::load(), devices, Screen::Idle);
+        let mut app = App::with_events(Config::load(), devices, Screen::Idle, events);
         app.go_idle();
         app
+    }
+
+    /// Para outras threads (instância única, bandeja, detector) falarem com o App.
+    pub fn events(&self) -> Sender<AppEvent> {
+        self.events_tx.clone()
+    }
+
+    /// Todo o trabalho que não desenha: roda com ou sem janela.
+    pub fn tick(&mut self) {
+        self.poll_setup();
+        self.poll_progress();
+
+        // microfone sumiu durante a gravação: para e processa o que existe
+        if let Screen::Recording(rec) = &self.screen {
+            if let Some(f) = rec.failed() {
+                self.stop_recording(Some(f));
+            }
+        }
+
+        let events: Vec<_> = self.events_rx.try_iter().collect();
+        for e in events {
+            self.on_event(e);
+        }
+        self.sync_sleep_guard();
+    }
+
+    fn on_event(&mut self, e: AppEvent) {
+        match e {
+            AppEvent::ShowWindow => self.show_requested = true,
+            AppEvent::Quit => {
+                if self.wants_close_confirmation() {
+                    self.confirm_close = true;
+                    self.show_requested = true;
+                } else {
+                    self.quit = true;
+                }
+            }
+            // ligados nas próximas tarefas (gravar call, detector, bandeja)
+            AppEvent::RecordCall
+            | AppEvent::StopRecording
+            | AppEvent::MicUsage { .. }
+            | AppEvent::EndAnswer { .. } => {}
+        }
+    }
+
+    pub fn window_opened(&mut self) {
+        self.window_open = true;
+        if matches!(self.screen, Screen::Idle) && self.monitor.is_none() {
+            self.start_monitor();
+        }
+    }
+
+    /// Sem janela não há ondinhas: solta o microfone.
+    pub fn window_closed(&mut self) {
+        self.window_open = false;
+        self.monitor = None;
+        self.confirm_close = false;
+    }
+
+    /// Alguém pediu para mostrar a janela desde a última chamada.
+    pub fn take_show_request(&mut self) -> bool {
+        std::mem::take(&mut self.show_requested)
+    }
+
+    pub fn should_quit(&self) -> bool {
+        self.quit
     }
 
     fn selected_mic(&self) -> Option<String> {
@@ -320,7 +407,9 @@ impl App {
             self.setup_rx = None;
             self.screen = Screen::Idle;
             self.refresh_pending();
-            self.start_monitor();
+            if self.window_open {
+                self.start_monitor();
+            }
         }
     }
 
@@ -485,14 +574,15 @@ impl App {
         matches!(self.screen, Screen::Recording(_) | Screen::Processing(_))
     }
 
-    /// Botão "Fechar" do modal. Gravando, finaliza o WAV em `gravacoes/` (oferecido na
+    /// Botão "Sair" do modal. Gravando, finaliza o WAV em `gravacoes/` (oferecido na
     /// próxima abertura).
-    fn close_now(&mut self, ctx: &egui::Context) {
+    fn quit_now(&mut self, ctx: &egui::Context) {
         if let Screen::Recording(rec) = std::mem::replace(&mut self.screen, Screen::Idle) {
             let _ = rec.stop();
         }
         self.sleep_guard = None;
-        self.force_close = true;
+        self.confirm_close = false;
+        self.quit = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
@@ -502,12 +592,12 @@ impl App {
         let recording = matches!(self.screen, Screen::Recording(_));
         egui::Modal::new(egui::Id::unique("confirm_close")).show(ctx, |ui| {
             ui.set_width(300.0);
-            ui.heading("Fechar?");
+            ui.heading("Sair?");
             ui.add_space(6.0);
-            ui.label(close_message(recording));
+            ui.label(quit_message(recording));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button("Fechar").clicked() {
+                if ui.button("Sair").clicked() {
                     close = true;
                 }
                 if ui.button("Continuar").clicked() {
@@ -516,7 +606,7 @@ impl App {
             });
         });
         if close {
-            self.close_now(ctx);
+            self.quit_now(ctx);
         } else if keep {
             self.confirm_close = false;
         }
@@ -572,27 +662,29 @@ fn spawn_pipeline(job: Job) -> Receiver<Progress> {
     rx
 }
 
-impl eframe::App for App {
+/// A janela: um `run_native` por abertura. O `App` fica fora dela e sobrevive ao fechar.
+pub struct Shell(pub Rc<RefCell<App>>);
+
+impl eframe::App for Shell {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut app = self.0.borrow_mut();
+        app.tick();
+        if app.should_quit() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if app.take_show_request() {
+            // já está aberta: só traz para a frente
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.0.borrow_mut().draw(ui);
+    }
+}
+
+impl App {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.poll_setup();
-        self.poll_progress();
-
-        // microfone sumiu durante a gravação: para e processa o que existe
-        if let Screen::Recording(rec) = &self.screen {
-            if let Some(f) = rec.failed() {
-                self.stop_recording(Some(f));
-            }
-        }
-
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.force_close
-            && self.wants_close_confirmation()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_close = true;
-        }
-
         egui::CentralPanel::default().show(ui, |ui| match kind(&self.screen) {
             Kind::Setup => setup::show(self, ui),
             Kind::Idle => idle::show(self, ui),
@@ -613,9 +705,9 @@ impl eframe::App for App {
             self.screen,
             Screen::Setup(_) | Screen::Idle | Screen::Recording(_) | Screen::Processing(_)
         );
-        if animated {
-            ctx.request_repaint_after(Duration::from_millis(33));
-        }
+        // mesmo parado, acorda de vez em quando para ler os eventos (ex.: ShowWindow)
+        let every = if animated { 33 } else { 250 };
+        ctx.request_repaint_after(Duration::from_millis(every));
     }
 }
 
@@ -732,15 +824,61 @@ mod tests {
     }
 
     #[test]
-    fn close_message_depends_on_state() {
+    fn quit_message_depends_on_state() {
         assert_eq!(
-            close_message(true),
-            "Parar a gravação e fechar? O áudio fica salvo e você pode processar depois."
+            quit_message(true),
+            "Parar a gravação e sair? O áudio fica salvo e você pode processar depois."
         );
         assert_eq!(
-            close_message(false),
-            "Fechar agora? O processamento será perdido, mas o áudio continua salvo."
+            quit_message(false),
+            "Sair agora? O processamento será perdido, mas o áudio continua salvo."
         );
+    }
+
+    #[test]
+    fn tick_sem_janela_processa_progresso() {
+        let mut app = processing_app();
+        let (tx, rx) = mpsc::channel();
+        app.proc_rx = Some(rx);
+        tx.send(Progress::Done(Outcome { md_path: "/x/a.md".into(), speakers: 1, duration_ms: 1 }))
+            .unwrap();
+        app.tick();
+        assert!(matches!(app.screen, Screen::Done(_)));
+    }
+
+    #[test]
+    fn show_window_vira_pedido_de_mostrar() {
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        assert!(!app.take_show_request());
+        app.events().send(AppEvent::ShowWindow).unwrap();
+        app.tick();
+        assert!(app.take_show_request());
+        assert!(!app.take_show_request());
+    }
+
+    #[test]
+    fn quit_parado_sai_e_quit_gravando_pede_confirmacao() {
+        let mut idle = App::with_state(Config::default(), vec![], Screen::Idle);
+        idle.events().send(AppEvent::Quit).unwrap();
+        idle.tick();
+        assert!(idle.should_quit());
+
+        let mut busy = processing_app();
+        busy.events().send(AppEvent::Quit).unwrap();
+        busy.tick();
+        assert!(!busy.should_quit());
+        assert!(busy.take_show_request());
+        assert!(busy.confirm_close);
+    }
+
+    #[test]
+    fn monitor_so_com_janela_aberta() {
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.window_opened();
+        assert!(app.window_open);
+        app.window_closed();
+        assert!(!app.window_open);
+        assert!(app.monitor.is_none());
     }
 
     #[test]
