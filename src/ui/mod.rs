@@ -60,6 +60,8 @@ pub struct Pending {
     pub wav: PathBuf,
     pub started_at: NaiveDateTime,
     pub duration_ms: Option<u64>,
+    /// Som do computador, se for uma call (o par do `wav`, que é o mic).
+    pub system: Option<PathBuf>,
 }
 
 pub enum Screen {
@@ -204,10 +206,11 @@ impl App {
     fn refresh_pending(&mut self) {
         self.pending = pending_recordings(&self.recordings_dir)
             .into_iter()
-            .map(|(wav, started_at)| Pending {
-                duration_ms: wav_duration_ms(&wav),
-                wav,
-                started_at,
+            .map(|p| Pending {
+                duration_ms: wav_duration_ms(&p.wav),
+                wav: p.wav,
+                started_at: p.started_at,
+                system: p.system,
             })
             .collect();
     }
@@ -756,7 +759,7 @@ mod tests {
         let wav = d.path().join("gravacao-20261028-143005.wav");
         std::fs::write(&wav, b"x").unwrap();
         let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
-        app.pending = vec![Pending { wav: wav.clone(), started_at: at(14, 30), duration_ms: None }];
+        app.pending = vec![Pending { wav: wav.clone(), started_at: at(14, 30), duration_ms: None, system: None }];
         app.request_discard(0);
         assert_eq!(app.confirm_discard.as_deref(), Some(wav.as_path()));
         assert!(wav.exists(), "só apaga depois de confirmar");
