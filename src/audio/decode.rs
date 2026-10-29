@@ -133,17 +133,34 @@ pub fn encode_ogg(wav: &Path, out: &Path) -> Result<()> {
     encode_ogg_with(&ffmpeg_bin(), wav, out)
 }
 
-/// Escreve em `<out>.part` e só renomeia no fim: um .ogg nunca fica pela metade.
+/// Call: `.ogg` estéreo, esquerdo = mic, direito = sistema (Opus 96 kbps).
+pub fn encode_ogg_stereo(left: &Path, right: &Path, out: &Path) -> Result<()> {
+    encode_part_then_rename(
+        &ffmpeg_bin(),
+        &[
+            "-i".as_ref(),
+            left.as_os_str(),
+            "-i".as_ref(),
+            right.as_os_str(),
+            "-filter_complex".as_ref(),
+            "[0:a][1:a]amerge=inputs=2[a]".as_ref(),
+            "-map".as_ref(),
+            "[a]".as_ref(),
+            "-ac".as_ref(),
+            "2".as_ref(),
+            "-c:a".as_ref(),
+            "libopus".as_ref(),
+            "-b:a".as_ref(),
+            "96k".as_ref(),
+        ],
+        out,
+    )
+}
+
 fn encode_ogg_with(bin: &str, wav: &Path, out: &Path) -> Result<()> {
-    let mut part = out.as_os_str().to_owned();
-    part.push(".part");
-    let part = std::path::PathBuf::from(part);
-    let res = run(
+    encode_part_then_rename(
         bin,
         &[
-            "-v".as_ref(),
-            "error".as_ref(),
-            "-y".as_ref(),
             "-i".as_ref(),
             wav.as_os_str(),
             "-c:a".as_ref(),
@@ -152,11 +169,20 @@ fn encode_ogg_with(bin: &str, wav: &Path, out: &Path) -> Result<()> {
             "64k".as_ref(),
             "-ac".as_ref(),
             "1".as_ref(),
-            "-f".as_ref(),
-            "ogg".as_ref(),
-            part.as_os_str(),
         ],
-    );
+        out,
+    )
+}
+
+/// Escreve em `<out>.part` e só renomeia no fim: um .ogg nunca fica pela metade.
+fn encode_part_then_rename(bin: &str, args: &[&std::ffi::OsStr], out: &Path) -> Result<()> {
+    let mut part = out.as_os_str().to_owned();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let mut full: Vec<&std::ffi::OsStr> = vec!["-v".as_ref(), "error".as_ref(), "-y".as_ref()];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["-f".as_ref(), "ogg".as_ref(), part.as_os_str()]);
+    let res = run(bin, &full);
     let res = match res {
         Ok(r) => r,
         Err(e) => {
