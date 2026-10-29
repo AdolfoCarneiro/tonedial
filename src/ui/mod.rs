@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 
+use crate::audio::call::CallRecorder;
 use crate::audio::decode;
 use crate::audio::record::{
-    Failure, Monitor, Recorder, list_input_devices, pending_recordings, recordings_dir,
+    Failure, Levels, Monitor, Recorder, list_input_devices, pending_recordings, recordings_dir,
     temp_wav_path, wav_duration_ms,
 };
 use crate::config::Config;
@@ -67,10 +68,57 @@ pub struct Pending {
     pub system: Option<PathBuf>,
 }
 
+/// Gravação em andamento: só o mic ou call (mic + som do computador).
+pub enum Rec {
+    Mic(Recorder),
+    Call(CallRecorder),
+}
+
+impl Rec {
+    fn mic(&self) -> &Recorder {
+        match self {
+            Rec::Mic(r) => r,
+            Rec::Call(c) => &c.mic,
+        }
+    }
+
+    /// Ondinhas do mic e, em call, as do som do computador.
+    pub fn levels(&self) -> (&Levels, Option<&Levels>) {
+        match self {
+            Rec::Mic(r) => (&r.levels, None),
+            Rec::Call(c) => (&c.mic.levels, c.system.as_ref().map(|s| &s.levels)),
+        }
+    }
+
+    pub fn is_call(&self) -> bool {
+        matches!(self, Rec::Call(_))
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.mic().elapsed()
+    }
+
+    pub fn failed(&self) -> Option<Failure> {
+        self.mic().failed()
+    }
+
+    pub fn started_at(&self) -> NaiveDateTime {
+        self.mic().started_at
+    }
+
+    /// Aviso do som do computador, se houver.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Rec::Mic(_) => None,
+            Rec::Call(c) => c.note(),
+        }
+    }
+}
+
 pub enum Screen {
     Setup(SetupState),
     Idle,
-    Recording(Recorder),
+    Recording(Rec),
     Processing(ProcessingState),
     Done(Outcome),
     Error(String),
@@ -115,13 +163,15 @@ pub struct App {
     proc_rx: Option<Receiver<Progress>>,
     recordings_dir: PathBuf,
     pending: Vec<Pending>,
-    /// WAV pendente esperando confirmação de "Descartar".
-    confirm_discard: Option<PathBuf>,
+    /// Gravação pendente esperando confirmação de "Descartar".
+    confirm_discard: Option<Pending>,
     sleep_guard: Option<SleepGuard>,
     /// Desligado no construtor puro, para os testes não chamarem o `systemd-inhibit`.
     inhibit_enabled: bool,
     /// Aviso da preparação dos modelos (ex.: não apagou o f16), mostrado no Idle.
     setup_warning: Option<String>,
+    /// `RecordCall` sem pasta de saída e sem janela: grava ao abrir a janela, que pergunta a pasta.
+    call_after_show: bool,
 }
 
 /// Título da tela de processamento de uma gravação.
@@ -145,6 +195,35 @@ pub fn quit_message(recording: bool) -> &'static str {
     } else {
         "Sair agora? O processamento será perdido, mas o áudio continua salvo."
     }
+}
+
+pub(crate) const NO_SYSTEM_NOTE: &str = "Não consegui gravar o som do computador; gravando só o microfone";
+
+/// O que processar de uma gravação pendente: um par vira call.
+fn source_for(p: &Pending) -> Source {
+    match &p.system {
+        Some(system) => Source::Call { mic: p.wav.clone(), system: system.clone(), started_at: p.started_at },
+        None => Source::Recording { wav: p.wav.clone(), started_at: p.started_at },
+    }
+}
+
+/// Fonte de uma call que acabou de parar. Sem som do computador (ou com o WAV dele vazio,
+/// quando o `pw-record` morreu na hora) vira gravação só do mic, com aviso.
+fn source_after_call(
+    mic: PathBuf,
+    system: Option<PathBuf>,
+    started_at: NaiveDateTime,
+    note: Option<String>,
+) -> (Source, Option<String>) {
+    let system = system.filter(|s| {
+        let ok = wav_duration_ms(s).is_some_and(|ms| ms > 0);
+        if !ok {
+            let _ = std::fs::remove_file(s);
+        }
+        ok
+    });
+    let note = if system.is_none() { Some(NO_SYSTEM_NOTE.to_string()) } else { note };
+    (source_for(&Pending { wav: mic, started_at, duration_ms: None, system }), note)
 }
 
 /// Segura a suspensão enquanto grava, processa ou baixa os modelos.
@@ -223,6 +302,7 @@ impl App {
             sleep_guard: None,
             inhibit_enabled: false,
             setup_warning: None,
+            call_after_show: false,
         }
     }
 
@@ -241,15 +321,17 @@ impl App {
 
     /// Botão "Descartar": só pede confirmação.
     fn request_discard(&mut self, i: usize) {
-        self.confirm_discard = self.pending.get(i).map(|p| p.wav.clone());
+        self.confirm_discard = self.pending.get(i).cloned();
     }
 
-    /// "Descartar" confirmado: apaga o WAV.
+    /// "Descartar" confirmado: apaga o WAV (os dois, se for call).
     fn discard_confirmed(&mut self) {
-        let Some(wav) = self.confirm_discard.take() else { return };
-        if let Err(e) = std::fs::remove_file(&wav) {
-            if wav.exists() {
-                self.mic_error = Some(format!("Não consegui apagar {}: {e}", wav.display()));
+        let Some(p) = self.confirm_discard.take() else { return };
+        for wav in std::iter::once(&p.wav).chain(p.system.as_ref()) {
+            if let Err(e) = std::fs::remove_file(wav) {
+                if wav.exists() {
+                    self.mic_error = Some(format!("Não consegui apagar {}: {e}", wav.display()));
+                }
             }
         }
         self.refresh_pending();
@@ -262,11 +344,11 @@ impl App {
             return;
         }
         self.monitor = None;
-        self.start_processing(
-            Source::Recording { wav: p.wav, started_at: p.started_at },
-            recording_title(p.started_at),
-            None,
-        );
+        let (source, note) = match &p.system {
+            Some(_) => source_after_call(p.wav.clone(), p.system.clone(), p.started_at, None),
+            None => (source_for(&p), None),
+        };
+        self.start_processing(source, recording_title(p.started_at), note);
     }
 
     /// Liga/desliga o bloqueio de suspensão conforme a tela.
@@ -332,6 +414,9 @@ impl App {
                 self.stop_recording(Some(f));
             }
         }
+        if self.window_open && std::mem::take(&mut self.call_after_show) {
+            self.record_call();
+        }
 
         let events: Vec<_> = self.events_rx.try_iter().collect();
         for e in events {
@@ -351,12 +436,26 @@ impl App {
                     self.quit = true;
                 }
             }
-            // ligados nas próximas tarefas (gravar call, detector, bandeja)
-            AppEvent::RecordCall
-            | AppEvent::StopRecording
-            | AppEvent::MicUsage { .. }
+            AppEvent::RecordCall => self.record_call(),
+            AppEvent::StopRecording => self.stop_recording(None),
+            // ligados nas próximas tarefas (detector, bandeja)
+            AppEvent::MicUsage { .. }
             | AppEvent::EndAnswer { .. } => {}
         }
+    }
+
+    /// Bandeja ou notificação pediram para gravar a call. Ocupado, ignora. Sem pasta de
+    /// saída e sem janela, abre a janela e grava por lá (o seletor de pasta precisa dela).
+    fn record_call(&mut self) {
+        if matches!(self.screen, Screen::Recording(_) | Screen::Processing(_) | Screen::Setup(_)) {
+            return;
+        }
+        if self.config.output_dir.is_none() && !self.window_open {
+            self.call_after_show = true;
+            self.show_requested = true;
+            return;
+        }
+        self.start_recording(true);
     }
 
     pub fn window_opened(&mut self) {
@@ -511,7 +610,8 @@ impl App {
         }
     }
 
-    fn start_recording(&mut self) {
+    /// `call`: grava também o som do computador.
+    pub fn start_recording(&mut self, call: bool) {
         if self.ensure_output_dir().is_none() {
             return;
         }
@@ -531,8 +631,13 @@ impl App {
             return;
         }
         self.monitor = None; // o Recorder abre o próprio stream
-        let wav = temp_wav_path(&self.recordings_dir, chrono::Local::now().naive_local());
-        match Recorder::start(&mic, wav) {
+        let now = chrono::Local::now().naive_local();
+        let rec = if call {
+            CallRecorder::start(&mic, &self.recordings_dir, now).map(Rec::Call)
+        } else {
+            Recorder::start(&mic, temp_wav_path(&self.recordings_dir, now)).map(Rec::Mic)
+        };
+        match rec {
             Ok(r) => self.screen = Screen::Recording(r),
             Err(e) => self.screen = Screen::Error(format!("Não foi possível gravar: {e:#}")),
         }
@@ -543,16 +648,36 @@ impl App {
         let Screen::Recording(rec) = std::mem::replace(&mut self.screen, Screen::Idle) else {
             return;
         };
-        let wav = rec.wav_path.clone();
-        let started_at = rec.started_at;
-        if let Err(e) = rec.stop() {
-            if !wav.is_file() {
+        let wav = rec.mic().wav_path.clone();
+        let started_at = rec.started_at();
+        // (WAV do sistema, aviso) de uma call, lidos antes de parar
+        let call = match &rec {
+            Rec::Mic(_) => None,
+            Rec::Call(c) => Some((c.system.as_ref().map(|s| s.wav_path.clone()), c.note())),
+        };
+        let stopped = match rec {
+            Rec::Mic(r) => r.stop().map(|_| None),
+            Rec::Call(c) => c.stop().map(|(_, system)| system),
+        };
+        let system = match stopped {
+            Ok(system) => system,
+            Err(e) if !wav.is_file() => {
                 self.screen = Screen::Error(format!("Não foi possível finalizar a gravação: {e:#}"));
                 return;
             }
-        }
-        let note = failure.map(|f| f.note().to_string());
-        self.start_processing(Source::Recording { wav, started_at }, recording_title(started_at), note);
+            // o mic falhou ao finalizar mas o arquivo existe; o do sistema é finalizado antes
+            Err(_) => call.as_ref().and_then(|(system, _)| system.clone()),
+        };
+        let (source, call_note) = match call {
+            None => (Source::Recording { wav, started_at }, None),
+            Some((_, note)) => source_after_call(wav, system, started_at, note),
+        };
+        let failure = failure.map(|f| f.note().to_string());
+        let note = match (failure, call_note) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        };
+        self.start_processing(source, recording_title(started_at), note);
     }
 
     fn open_file(&mut self, path: PathBuf) {
@@ -581,8 +706,11 @@ impl App {
     /// Botão "Sair" do modal. Gravando, finaliza o WAV em `gravacoes/` (oferecido na
     /// próxima abertura).
     fn quit_now(&mut self, ctx: &egui::Context) {
-        if let Screen::Recording(rec) = std::mem::replace(&mut self.screen, Screen::Idle) {
-            let _ = rec.stop();
+        // os WAVs ficam em `gravacoes/` e voltam como pendentes (um par, se for call)
+        match std::mem::replace(&mut self.screen, Screen::Idle) {
+            Screen::Recording(Rec::Mic(r)) => drop(r.stop()),
+            Screen::Recording(Rec::Call(c)) => drop(c.stop()),
+            _ => {}
         }
         self.sleep_guard = None;
         self.confirm_close = false;
@@ -718,10 +846,10 @@ impl App {
     }
 }
 
-/// Barras verticais espelhadas dos níveis (0..1) numa área de ~110 px; o mais recente à direita.
-pub(crate) fn draw_levels(ui: &mut egui::Ui, levels: &[f32]) {
+/// Barras verticais espelhadas dos níveis (0..1) numa faixa de `height` px; o mais recente à direita.
+pub(crate) fn draw_levels(ui: &mut egui::Ui, levels: &[f32], height: f32) {
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 110.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
     let (bar_w, gap) = (3.0, 2.0);
@@ -912,7 +1040,7 @@ mod tests {
         let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
         app.pending = vec![Pending { wav: wav.clone(), started_at: at(14, 30), duration_ms: None, system: None }];
         app.request_discard(0);
-        assert_eq!(app.confirm_discard.as_deref(), Some(wav.as_path()));
+        assert_eq!(app.confirm_discard.as_ref().map(|p| p.wav.as_path()), Some(wav.as_path()));
         assert!(wav.exists(), "só apaga depois de confirmar");
         app.discard_confirmed();
         assert!(!wav.exists());
@@ -931,6 +1059,122 @@ mod tests {
         assert_eq!(app.pending.len(), 1);
         assert_eq!(app.pending[0].wav, wav);
         assert_eq!(app.pending[0].started_at, at(14, 30));
+    }
+
+    fn write_wav(path: &std::path::Path, samples: usize) {
+        let mut s = crate::audio::record::WavSink::create(path, 48_000).unwrap();
+        s.push(&vec![0.1f32; samples]).unwrap();
+        s.finish().unwrap();
+    }
+
+    #[test]
+    fn processar_par_pendente_vira_source_call() {
+        let par = Pending {
+            wav: "/g/a-mic.wav".into(),
+            started_at: at(14, 30),
+            duration_ms: None,
+            system: Some("/g/a-sistema.wav".into()),
+        };
+        match source_for(&par) {
+            Source::Call { mic, system, started_at } => {
+                assert_eq!(mic, PathBuf::from("/g/a-mic.wav"));
+                assert_eq!(system, PathBuf::from("/g/a-sistema.wav"));
+                assert_eq!(started_at, at(14, 30));
+            }
+            other => panic!("esperava Call, veio {other:?}"),
+        }
+        let simples = Pending { system: None, ..par };
+        assert!(matches!(source_for(&simples), Source::Recording { ref wav, .. } if wav == &PathBuf::from("/g/a-mic.wav")));
+    }
+
+    #[test]
+    fn descartar_par_apaga_os_dois() {
+        let d = tempfile::tempdir().unwrap();
+        let (mic, sis) = crate::audio::record::temp_call_paths(d.path(), at(14, 30));
+        std::fs::write(&mic, b"x").unwrap();
+        std::fs::write(&sis, b"x").unwrap();
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.recordings_dir = d.path().to_path_buf();
+        app.pending = vec![Pending { wav: mic.clone(), started_at: at(14, 30), duration_ms: None, system: Some(sis.clone()) }];
+        app.request_discard(0);
+        assert!(mic.exists() && sis.exists(), "só apaga depois de confirmar");
+        app.discard_confirmed();
+        assert!(!mic.exists());
+        assert!(!sis.exists());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn call_sem_sistema_grava_so_mic_com_aviso() {
+        let d = tempfile::tempdir().unwrap();
+        let (mic, sis) = crate::audio::record::temp_call_paths(d.path(), at(14, 30));
+        write_wav(&mic, 4800);
+
+        // pw-record nem abriu
+        let (src, note) = source_after_call(mic.clone(), None, at(14, 30), None);
+        assert!(matches!(src, Source::Recording { ref wav, .. } if wav == &mic));
+        assert_eq!(note.as_deref(), Some(NO_SYSTEM_NOTE));
+
+        // pw-record abriu e morreu na hora: WAV do sistema vazio é apagado
+        write_wav(&sis, 0);
+        let (src, note) = source_after_call(mic.clone(), Some(sis.clone()), at(14, 30), None);
+        assert!(matches!(src, Source::Recording { .. }));
+        assert_eq!(note.as_deref(), Some(NO_SYSTEM_NOTE));
+        assert!(!sis.exists());
+
+        // WAV do sistema sumiu
+        let (src, _) = source_after_call(mic.clone(), Some(sis.clone()), at(14, 30), None);
+        assert!(matches!(src, Source::Recording { .. }));
+
+        // com som do computador: Call, e o aviso que veio passa adiante
+        write_wav(&sis, 4800);
+        let (src, note) = source_after_call(mic.clone(), Some(sis.clone()), at(14, 30), Some("parou".into()));
+        assert!(matches!(src, Source::Call { ref system, .. } if system == &sis));
+        assert_eq!(note.as_deref(), Some("parou"));
+        assert!(sis.exists());
+    }
+
+    #[test]
+    fn sair_gravando_deixa_par_pendente() {
+        let d = tempfile::tempdir().unwrap();
+        let (mic, sis) = crate::audio::record::temp_call_paths(d.path(), at(14, 30));
+        write_wav(&mic, 48_000);
+        write_wav(&sis, 48_000);
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.recordings_dir = d.path().to_path_buf();
+        app.refresh_pending();
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].wav, mic);
+        assert_eq!(app.pending[0].system.as_deref(), Some(sis.as_path()));
+        assert_eq!(app.pending[0].duration_ms, Some(1000));
+    }
+
+    #[test]
+    fn record_call_ocupado_e_ignorado() {
+        let mut app = processing_app();
+        app.config.output_dir = Some(std::env::temp_dir());
+        app.events().send(AppEvent::RecordCall).unwrap();
+        app.tick();
+        assert!(matches!(app.screen, Screen::Processing(_)));
+        assert!(!app.take_show_request());
+    }
+
+    #[test]
+    fn record_call_sem_pasta_e_sem_janela_abre_a_janela() {
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.events().send(AppEvent::RecordCall).unwrap();
+        app.tick();
+        assert!(app.take_show_request());
+        assert!(app.call_after_show);
+        assert!(matches!(app.screen, Screen::Idle));
+    }
+
+    #[test]
+    fn stop_recording_sem_gravacao_nao_faz_nada() {
+        let mut app = App::with_state(Config::default(), vec![], Screen::Idle);
+        app.events().send(AppEvent::StopRecording).unwrap();
+        app.tick();
+        assert!(matches!(app.screen, Screen::Idle));
     }
 
     #[test]
