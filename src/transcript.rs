@@ -134,6 +134,56 @@ pub fn align(words: &[Word], segments: &[SpeakerSegment]) -> Vec<Utterance> {
         .collect()
 }
 
+/// Falante 0 é o usuário ("Eu"); o `align` numera os outros a partir de 1.
+pub const ME: u32 = 0;
+
+/// Janela para considerar que o mic captou, por eco, o que saiu no som do computador.
+const ECHO_WINDOW_MS: u64 = 1000;
+
+/// Descarta do mic as palavras que o sistema também tem, quase no mesmo instante (eco dos alto-falantes).
+pub fn drop_echo(mic: Vec<Word>, system: &[Word]) -> Vec<Word> {
+    let sys: Vec<(u64, String)> = system.iter().map(|w| (w.start_ms, normalize(&w.text))).collect();
+    mic.into_iter()
+        .filter(|w| {
+            let n = normalize(&w.text);
+            n.is_empty() || !sys.iter().any(|(start, sn)| *sn == n && start.abs_diff(w.start_ms) <= ECHO_WINDOW_MS)
+        })
+        .collect()
+}
+
+/// Junta o mic (todo "Eu") com o sistema (separado em falantes) numa conversa só, por tempo.
+pub fn align_call(mic: &[Word], system: &[Word], segments: &[SpeakerSegment]) -> Vec<Utterance> {
+    let mut order: Vec<u32> = Vec::new();
+    // (início, 0 = mic / 1 = sistema, falante, palavra); no empate o mic vem primeiro.
+    let mut all: Vec<(u64, u8, u32, &Word)> = mic.iter().map(|w| (w.start_ms, 0, ME, w)).collect();
+    for w in system {
+        let id = pick_segment(w, segments);
+        if !order.contains(&id) {
+            order.push(id);
+        }
+        let speaker = order.iter().position(|&x| x == id).unwrap() as u32 + 1;
+        all.push((w.start_ms, 1, speaker, w));
+    }
+    all.sort_by_key(|(start, source, _, _)| (*start, *source));
+    let mut raw: Vec<(u32, u64, String)> = Vec::new();
+    for (_, _, speaker, w) in all {
+        match raw.last_mut() {
+            Some((last, _, text)) if *last == speaker => {
+                text.push(' ');
+                text.push_str(&w.text);
+            }
+            _ => raw.push((speaker, w.start_ms, w.text.clone())),
+        }
+    }
+    raw.into_iter()
+        .map(|(speaker, start_ms, text)| Utterance {
+            speaker,
+            start_ms,
+            text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+        })
+        .collect()
+}
+
 pub fn format_ts(ms: u64) -> String {
     let s = ms / 1000;
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -156,12 +206,8 @@ pub fn render_markdown(header: &Header, utterances: &[Utterance]) -> String {
         header.source_name
     );
     for u in utterances {
-        out.push_str(&format!(
-            "\n**Falante {}** [{}]: {}\n",
-            u.speaker,
-            format_ts(u.start_ms),
-            u.text
-        ));
+        let label = if u.speaker == ME { "Eu".to_string() } else { format!("Falante {}", u.speaker) };
+        out.push_str(&format!("\n**{}** [{}]: {}\n", label, format_ts(u.start_ms), u.text));
     }
     out
 }
@@ -324,5 +370,49 @@ mod tests {
 
         let short = Header { duration_ms: 52 * 60_000, ..header };
         assert!(render_markdown(&short, &[]).contains("- Duração: 52min\n"));
+    }
+
+    #[test]
+    fn drop_echo_remove_palavra_do_mic_repetida_no_sistema() {
+        let mic = vec![word(1000, 1300, "Bom"), word(5000, 5200, "certo")];
+        let sys = [word(1600, 1900, "bom,")];
+        assert_eq!(drop_echo(mic, &sys), vec![word(5000, 5200, "certo")]);
+    }
+
+    #[test]
+    fn drop_echo_mantem_palavra_igual_longe_no_tempo() {
+        let mic = vec![word(3000, 3200, "sim")];
+        let sys = [word(1000, 1200, "sim")];
+        assert_eq!(drop_echo(mic.clone(), &sys), mic);
+    }
+
+    #[test]
+    fn align_call_intercala_eu_e_falantes_por_tempo() {
+        let mic = [word(0, 400, "oi"), word(500, 900, "gente")];
+        let sys = [word(1000, 1400, "olá"), word(3000, 3400, "tchau")];
+        let segs = [seg(900, 2000, 5), seg(2900, 3500, 2)];
+        let u = align_call(&mic, &sys, &segs);
+        assert_eq!(
+            u.iter().map(|x| (x.speaker, x.text.as_str())).collect::<Vec<_>>(),
+            vec![(ME, "oi gente"), (1, "olá"), (2, "tchau")]
+        );
+    }
+
+    #[test]
+    fn align_call_sem_sistema_fica_so_eu() {
+        let u = align_call(&[word(0, 100, "a")], &[], &[]);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].speaker, ME);
+    }
+
+    #[test]
+    fn markdown_escreve_eu() {
+        let h = Header {
+            recorded_at: NaiveDate::from_ymd_opt(2026, 10, 28).unwrap().and_hms_opt(14, 30, 0).unwrap(),
+            duration_ms: 60_000,
+            source_name: "x.ogg".into(),
+        };
+        let md = render_markdown(&h, &[Utterance { speaker: ME, start_ms: 3000, text: "bom dia".into() }]);
+        assert!(md.contains("**Eu** [00:00:03]: bom dia"), "{md}");
     }
 }
