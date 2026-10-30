@@ -1,26 +1,26 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="navy" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#26355a"/><stop offset="1" stop-color="#18213a"/>
+    <linearGradient id="pink" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffd3e3"/><stop offset="1" stop-color="#f28ab2"/>
     </linearGradient>
-    <linearGradient id="pearl" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#fffaf3"/><stop offset=".5" stop-color="#fbe3d6"/><stop offset="1" stop-color="#eeb9b3"/>
-    </linearGradient>
-    <radialGradient id="nacre" cx="40%" cy="40%" r="70%">
-      <stop offset="0" stop-color="#ffd9e2"/><stop offset=".6" stop-color="#f19bb0"/><stop offset="1" stop-color="#c9667f"/>
-    </radialGradient>
   </defs>
-  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#navy)"/>
-  <g transform="translate(-8,-2)">
-    <circle cx="58" cy="66" r="40" fill="url(#pearl)" stroke="#c98a86" stroke-width="2"/>
-    <path d="M58 66 m-4 0 a4 4 0 1 1 8 0 a8 8 0 1 1 -16 0 a13 13 0 1 1 26 0 a19 19 0 1 1 -38 0 a26 26 0 1 1 52 0 a33 33 0 1 1 -66 0" fill="none" stroke="#d79a92" stroke-width="2.6" stroke-linecap="round"/>
-    <ellipse cx="90" cy="80" rx="15" ry="19" transform="rotate(-18 90 80)" fill="#fffaf3" stroke="#c98a86" stroke-width="2"/>
-    <ellipse cx="91" cy="81" rx="10" ry="14" transform="rotate(-18 91 81)" fill="url(#nacre)"/>
-    <ellipse cx="88" cy="75" rx="3" ry="4.5" transform="rotate(-18 88 75)" fill="#fff" opacity=".5"/>
-    <circle cx="58" cy="66" r="5" fill="#fffaf3" stroke="#c98a86" stroke-width="2"/>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#131a2b"/>
+  <!-- concha: topo com nós, espira no alto à esquerda -->
+  <path d="M30 34
+           Q30 26 38 27 Q42 21 50 24 Q56 19 63 25 Q71 23 75 31 Q83 33 84 42
+           C92 52 92 72 84 84 C76 96 62 100 50 98 C36 96 26 86 26 72
+           C26 60 30 52 36 46 Q28 42 30 34 Z" fill="url(#pink)"/>
+  <g fill="none" stroke="#131a2b" stroke-linecap="round">
+    <!-- espiral -->
+    <path stroke-width="4" d="M52 75 a2.5 2.5 0 1 1 -5 0 a6.5 6.5 0 0 1 13 0 a11 11 0 0 1 -22 0 a16 16 0 0 1 30 -8"/>
+    <!-- faixas do topo -->
+    <path stroke-width="3.5" d="M38 44 C46 36 60 34 70 40"/>
+    <path stroke-width="3.5" d="M34 34 C44 30 52 30 58 32"/>
+    <!-- lábio da abertura -->
+    <path stroke-width="4" d="M78 46 C86 58 86 78 74 90"/>
   </g>
-  <g transform="translate(-4,-2)" fill="none" stroke="#3ec6c1" stroke-width="5" stroke-linecap="round">
-    <path d="M106 73 A9 9 0 0 1 106 87"/>
-    <path d="M112 66 A16 16 0 0 1 112 94" opacity=".6"/>
+  <g fill="none" stroke="#f28ab2" stroke-width="5.5" stroke-linecap="round">
+    <path d="M99 57 A13 13 0 0 1 99 79"/>
+    <path d="M108 49 A23 23 0 0 1 108 87"/>
   </g>
 </svg>
